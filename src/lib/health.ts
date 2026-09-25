@@ -20,20 +20,25 @@ export type Health = {
 
 const HOUR = 60 * 60 * 1000;
 
+/** A variant is overdue (or without a recent result) after this long. */
+export const STALE_AFTER_MS = 26 * HOUR;
+
+/** Counts of active variants, computed with head count queries by the caller. */
+export type VariantHealthCounts = {
+  /** Not checked at all within STALE_AFTER_MS (includes never checked). */
+  overdue: number;
+  /** Supported, but no conclusive result (registered/unregistered) within STALE_AFTER_MS. */
+  inconclusive: number;
+};
+
 /**
  * Health is based on evidence that scheduled runs actually executed,
  * never on the mere existence of a cron configuration.
  */
-export function monitoringHealth(
-  runs: RunRow[],
-  activeVariants: { last_checked_at: string | null }[],
-  now: Date,
-): Health {
+export function monitoringHealth(runs: RunRow[], counts: VariantHealthCounts, now: Date): Health {
   const scheduled = runs.filter((r) => r.trigger === "cron" || r.trigger === "continuation");
   const lastScheduled = scheduled[0];
-  const overdue = activeVariants.filter(
-    (v) => !v.last_checked_at || now.getTime() - new Date(v.last_checked_at).getTime() > 26 * HOUR,
-  ).length;
+  const { overdue, inconclusive } = counts;
 
   if (!lastScheduled) {
     return {
@@ -55,7 +60,7 @@ export function monitoringHealth(
       detail: `${lastScheduled.message ?? "Proses berhenti sebelum selesai."} Buka Pengaturan > Riwayat pemantauan untuk detail.`,
     };
   }
-  if (age > 26 * HOUR) {
+  if (age > STALE_AFTER_MS) {
     return {
       tone: "error",
       title: "Pemantauan terjadwal terlambat",
@@ -68,6 +73,15 @@ export function monitoringHealth(
       title: `${overdue} varian belum dicek dalam 26 jam terakhir`,
       detail:
         "Proses terjadwal berjalan, tetapi sebagian domain belum sempat dicek (misalnya baru ditambahkan atau batas waktu tercapai). Proses lanjutan dan jadwal berikutnya akan mengeceknya.",
+    };
+  }
+  if (inconclusive > 0) {
+    return {
+      tone: "warning",
+      title: `${inconclusive} varian belum mendapat hasil pasti dalam 26 jam terakhir`,
+      detail:
+        "Varian ini sudah dicek, tetapi hasilnya tidak pasti (server registri tidak merespons, membatasi permintaan, atau hasil belum terkonfirmasi). " +
+        "Selama itu, pendaftaran baru pada varian ini belum bisa terdeteksi. Penyebabnya ada di daftar \"Pengecekan tertunda atau gagal\" di bawah.",
     };
   }
   return {

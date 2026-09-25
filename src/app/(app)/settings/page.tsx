@@ -26,6 +26,8 @@ export default async function SettingsPage() {
     supabase.from("monitor_runs").select("*").order("started_at", { ascending: false }).limit(20),
     suffixSupport(),
   ]);
+  const loadError = settingsRes.error ?? runsRes.error;
+  if (loadError) throw new Error(`Settings page query failed: ${loadError.message}`);
   const settings = settingsRes.data;
   const config = configStatus();
   const tokenConfigured = config.find((c) => c.name === "TELEGRAM_BOT_TOKEN")?.ok ?? false;
@@ -146,7 +148,7 @@ export default async function SettingsPage() {
               <li key={c.name} className="flex items-center justify-between gap-3 py-2">
                 <span className="font-mono text-xs sm:text-sm">{c.name}</span>
                 <span className={c.ok ? "text-emerald-700" : c.required ? "text-red-700" : "text-slate-500"}>
-                  {c.ok ? "Terisi" : c.required ? "Belum diisi" : "Tidak diisi (opsional)"}
+                  {c.ok ? "Terisi" : c.invalid ? "Tidak valid" : c.required ? "Belum diisi" : "Tidak diisi (opsional)"}
                 </span>
               </li>
             ))}

@@ -4,18 +4,31 @@ import type { MonitorRepository, RunStatus, RunTrigger } from "./repository";
 import { decideTransition, needsConfirmation, type DomainState, type DomainUpdate } from "./transition";
 
 export const MONITOR_DEFAULTS = {
-  /** Wall-clock budget for one invocation; Vercel Hobby allows 300 s. */
-  budgetMs: 240_000,
-  /** Stop claiming new work when less than this remains. */
-  reserveMs: 30_000,
+  /** No new check starts after this point of an invocation. */
+  budgetMs: 200_000,
+  /** Stop claiming new batches when less than this remains of budgetMs. */
+  reserveMs: 10_000,
+  /**
+   * Hard limit for any registry request, including retries and confirmation
+   * lookups of checks already in progress. Leaves time to save results,
+   * deliver alerts and close the run before Vercel Hobby's 300 s limit.
+   */
+  hardLimitMs: 250_000,
   concurrency: 4,
   batchSize: 20,
-  /** A variant is due when its last check is older than this. */
-  dueAgeMs: 20 * 60 * 60 * 1000,
-  claimSeconds: 120,
+  /**
+   * A variant is due when its last check is older than this. Short enough that
+   * a manual check during the day never makes the next daily run skip it, long
+   * enough that continuation runs of the same day do not re-check it.
+   */
+  dueAgeMs: 3 * 60 * 60 * 1000,
+  /** Covers a whole invocation, so claims never expire while a run is alive. */
+  claimSeconds: 300,
   lockTtlSeconds: 320,
   confirmDelayMs: 3_000,
   maxDeliveryAttempts: 3,
+  /** A delivery stuck in "sending" this long is assumed dead and retried. */
+  staleSendingMs: 10 * 60 * 1000,
 };
 
 export type EngineDeps = {
@@ -33,6 +46,8 @@ export type RunOptions = {
   depth?: number;
   /** For manual "check everything": treat every active variant as due. */
   forceAll?: boolean;
+  /** Whether the caller will start a continuation run for remaining work. */
+  willContinue?: boolean;
 } & Partial<typeof MONITOR_DEFAULTS>;
 
 export type RunOutcome = {
@@ -47,23 +62,25 @@ export type RunOutcome = {
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-type CheckOutcome = { status: DomainUpdate["status"]; event: boolean };
+type CheckOutcome = { status: DomainUpdate["status"]; event: boolean; deferred?: boolean };
 
 /** Check one variant, persist results and create events/notifications idempotently. */
 export async function checkDomain(
   deps: EngineDeps,
   state: DomainState,
   runId: string | null,
-  confirmDelayMs = MONITOR_DEFAULTS.confirmDelayMs,
+  options: { confirmDelayMs?: number; deadline?: number } = {},
 ): Promise<CheckOutcome> {
   const { repo, provider } = deps;
   const now = deps.now ?? (() => new Date());
   const sleep = deps.sleep ?? defaultSleep;
+  const confirmDelayMs = options.confirmDelayMs ?? MONITOR_DEFAULTS.confirmDelayMs;
+  const deadline = options.deadline;
   const suffix = state.suffix;
 
   let primary: LookupResult;
   try {
-    primary = await provider.lookup(state.fqdn, suffix);
+    primary = await provider.lookup(state.fqdn, suffix, { deadline });
   } catch (err) {
     primary = {
       status: "unknown",
@@ -72,49 +89,66 @@ export async function checkDomain(
       durationMs: 0,
     };
   }
+  // Out of time before any request was sent: record nothing, so the domain
+  // stays due and a continuation run checks it.
+  if (primary.deferred) return { status: state.status, event: false, deferred: true };
   await repo.saveCheck(state.id, runId, primary, false, now());
 
   let confirmation: LookupResult | undefined;
   if (needsConfirmation(state, primary)) {
-    await sleep(confirmDelayMs);
-    try {
-      confirmation = await provider.lookup(state.fqdn, suffix);
-    } catch {
-      confirmation = { status: "unknown", source: provider.name, error: "Pemeriksaan ulang gagal.", durationMs: 0 };
+    // Without enough time for a proper second lookup the change stays
+    // unconfirmed ("unknown") and is re-checked by the next run.
+    const timeLeft = deadline === undefined ? Number.POSITIVE_INFINITY : deadline - now().getTime();
+    if (timeLeft > confirmDelayMs + 5_000) {
+      await sleep(confirmDelayMs);
+      try {
+        confirmation = await provider.lookup(state.fqdn, suffix, { deadline });
+      } catch {
+        confirmation = { status: "unknown", source: provider.name, error: "Pemeriksaan ulang gagal.", durationMs: 0 };
+      }
+      await repo.saveCheck(state.id, runId, confirmation, true, now());
     }
-    await repo.saveCheck(state.id, runId, confirmation, true, now());
   }
 
   const at = now();
   const decision = decideTransition(state, primary, confirmation, at);
 
-  // Event and notification are written before the state update: if anything
-  // fails midway, the next check reproduces the same dedupe key instead of
-  // silently losing (or duplicating) the alert.
+  // Event, notification and delivery are written before the state update and
+  // each step is idempotent. If anything fails midway, the domain keeps its
+  // old state, the next check produces the same dedupe key, and the chain is
+  // completed without creating duplicates.
   let eventCreated = false;
   if (decision.event) {
-    const eventId = await repo.insertEvent(state.id, decision.event, at);
-    eventCreated = eventId !== null;
-    if (eventId && decision.event.notify) {
+    const { id: eventId, created } = await repo.insertEvent(state.id, decision.event, at);
+    eventCreated = created;
+    if (decision.event.notify) {
       const notificationId = await repo.createNotification(
         eventId,
         decision.event.alert ? "alert" : "info",
         decision.event.title,
         decision.event.message,
       );
-      if (notificationId && decision.event.alert) {
-        await repo.queueDelivery(notificationId, "telegram");
-      }
+      if (decision.event.alert) await repo.queueDelivery(notificationId, "telegram");
     }
   }
   await repo.applyUpdate(state.id, decision.update);
   return { status: decision.update.status, event: eventCreated };
 }
 
-/** Deliver queued Telegram notifications (at most once per notification). */
-export async function deliverPending(deps: EngineDeps, maxAttempts = MONITOR_DEFAULTS.maxDeliveryAttempts) {
+/**
+ * Deliver queued Telegram notifications. Each delivery is claimed atomically
+ * before sending; one stuck in "sending" (worker died) is retried after
+ * staleSendingMs, within the attempt limit.
+ */
+export async function deliverPending(
+  deps: EngineDeps,
+  options: { maxAttempts?: number; staleSendingMs?: number; deadline?: number } = {},
+) {
   const { repo } = deps;
-  const pending = await repo.listPendingDeliveries(50, maxAttempts);
+  const now = deps.now ?? (() => new Date());
+  const maxAttempts = options.maxAttempts ?? MONITOR_DEFAULTS.maxDeliveryAttempts;
+  const staleSendingMs = options.staleSendingMs ?? MONITOR_DEFAULTS.staleSendingMs;
+  const pending = await repo.listPendingDeliveries(50, maxAttempts, staleSendingMs);
   if (pending.length === 0) return { sent: 0, failed: 0, skipped: 0 };
   const settings = await repo.getTelegramSettings();
   const token = deps.telegramToken ?? null;
@@ -122,7 +156,9 @@ export async function deliverPending(deps: EngineDeps, maxAttempts = MONITOR_DEF
     failed = 0,
     skipped = 0;
   for (const d of pending) {
-    if (!(await repo.claimDelivery(d.id, maxAttempts))) continue;
+    // Leave the rest for the next run rather than risk being killed mid-send.
+    if (options.deadline !== undefined && options.deadline - now().getTime() < 15_000) break;
+    if (!(await repo.claimDelivery(d.id, maxAttempts, staleSendingMs))) continue;
     if (!settings.enabled || !settings.chatId || !token) {
       await repo.markDelivery(d.id, "skipped", "Telegram belum diaktifkan atau belum dikonfigurasi.");
       skipped++;
@@ -176,63 +212,87 @@ export async function runMonitor(deps: EngineDeps, opts: RunOptions): Promise<Ru
   }
 
   const dueBefore = opts.forceAll ? started : new Date(started.getTime() - cfg.dueAgeMs);
-  const deadline = started.getTime() + cfg.budgetMs;
+  const stopStarting = started.getTime() + cfg.budgetMs;
+  const hardDeadline = started.getTime() + cfg.hardLimitMs;
   let checked = 0,
     conclusive = 0,
     errors = 0,
     events = 0;
   let fatal: string | null = null;
-
-  try {
-    while (deadline - now().getTime() > cfg.reserveMs) {
-      const batch = await repo.claimDue(cfg.batchSize, dueBefore, cfg.claimSeconds);
-      if (batch.length === 0) break;
-      const unstarted = new Set(batch.map((d) => d.id));
-      await pool(batch, cfg.concurrency, async (state) => {
-        if (deadline - now().getTime() <= cfg.reserveMs) return;
-        unstarted.delete(state.id);
-        try {
-          const r = await checkDomain(deps, state, runId, cfg.confirmDelayMs);
-          checked++;
-          if (r.status === "registered" || r.status === "unregistered") conclusive++;
-          else if (r.status === "unknown") errors++;
-          if (r.event) events++;
-        } catch (err) {
-          errors++;
-          console.error(`Check failed for ${state.fqdn}:`, err);
-          await repo.releaseClaims([state.id]).catch(() => {});
-        }
-      });
-      if (unstarted.size > 0) await repo.releaseClaims([...unstarted]);
-    }
-    await deliverPending(deps, cfg.maxDeliveryAttempts);
-  } catch (err) {
-    fatal = err instanceof Error ? err.message : String(err);
-    console.error("Monitor run failed:", err);
-  }
-
   let remaining = 0;
-  try {
-    remaining = await repo.countDue(dueBefore);
-  } catch {
-    remaining = -1;
-  }
+  // Set when a lookup could not start before the hard deadline: stop claiming.
+  let outOfTime = false;
 
-  // "errors" counts checks that ended as unknown (provider failures, timeouts).
+  try {
+    try {
+      while (!outOfTime && stopStarting - now().getTime() > cfg.reserveMs) {
+        const batch = await repo.claimDue(cfg.batchSize, dueBefore, cfg.claimSeconds);
+        if (batch.length === 0) break;
+        // Claims of variants not checked in this run are released right away.
+        const unstarted = new Set(batch.map((d) => d.id));
+        await pool(batch, cfg.concurrency, async (state) => {
+          if (now().getTime() >= stopStarting) return;
+          unstarted.delete(state.id);
+          try {
+            const r = await checkDomain(deps, state, runId, {
+              confirmDelayMs: cfg.confirmDelayMs,
+              deadline: hardDeadline,
+            });
+            if (r.deferred) {
+              outOfTime = true;
+              unstarted.add(state.id);
+              return;
+            }
+            checked++;
+            if (r.status === "registered" || r.status === "unregistered") conclusive++;
+            else if (r.status === "unknown") errors++;
+            if (r.event) events++;
+          } catch (err) {
+            // The claim is kept until it expires so this run does not retry
+            // the same failing row in a loop; the next run picks it up.
+            errors++;
+            console.error(`Check failed for ${state.fqdn}:`, err);
+          }
+        });
+        if (unstarted.size > 0) await repo.releaseClaims([...unstarted]);
+      }
+      await deliverPending(deps, {
+        maxAttempts: cfg.maxDeliveryAttempts,
+        staleSendingMs: cfg.staleSendingMs,
+        deadline: started.getTime() + 285_000,
+      });
+    } catch (err) {
+      fatal = err instanceof Error ? err.message : String(err);
+      console.error("Monitor run failed:", err);
+    }
+
+    try {
+      remaining = await repo.countDue(dueBefore);
+    } catch {
+      remaining = -1;
+    }
+  } finally {
+    // "errors" counts checks that ended as unknown (provider failures, timeouts).
+    const status: RunStatus = fatal ? "failed" : remaining !== 0 ? "partial" : "success";
+    const message = fatal
+      ? `Proses gagal: ${fatal}`
+      : remaining > 0
+        ? opts.willContinue
+          ? `${remaining} domain belum sempat dicek dalam batas waktu; dilanjutkan otomatis oleh proses lanjutan.`
+          : `${remaining} domain belum sempat dicek dalam batas waktu; akan dicek pada jadwal berikutnya.`
+        : null;
+    await repo
+      .finishRun(runId, status, {
+        checked_count: checked,
+        conclusive_count: conclusive,
+        error_count: errors,
+        remaining_count: Math.max(remaining, 0),
+        events_count: events,
+        message,
+      })
+      .catch((err) => console.error("finishRun failed:", err));
+    await repo.releaseLock(runId).catch((err) => console.error("releaseLock failed:", err));
+  }
   const status: RunStatus = fatal ? "failed" : remaining !== 0 ? "partial" : "success";
-  const message = fatal
-    ? `Proses gagal: ${fatal}`
-    : remaining > 0
-      ? `${remaining} domain belum sempat dicek dalam batas waktu; akan dilanjutkan otomatis.`
-      : null;
-  await repo.finishRun(runId, status, {
-    checked_count: checked,
-    conclusive_count: conclusive,
-    error_count: errors,
-    remaining_count: Math.max(remaining, 0),
-    events_count: events,
-    message,
-  });
-  await repo.releaseLock(runId);
   return { runId, status, checked, conclusive, errors, events, remaining: Math.max(remaining, 0) };
 }

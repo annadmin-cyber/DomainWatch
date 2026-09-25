@@ -44,16 +44,23 @@ export interface MonitorRepository {
   saveCheck(domainId: string, runId: string | null, result: LookupResult, confirmation: boolean, at: Date): Promise<void>;
   applyUpdate(domainId: string, update: DomainUpdate): Promise<void>;
 
-  /** Insert an event; returns null when an event with the same dedupe key exists. */
-  insertEvent(domainId: string, event: NewEvent, detectedAt: Date): Promise<string | null>;
-  /** Create the notification for an event (idempotent per event). */
-  createNotification(eventId: string, kind: "alert" | "info", title: string, body: string): Promise<string | null>;
+  /**
+   * Insert an event, or return the existing one with the same dedupe key
+   * (created=false), so a retried check can finish the notification chain.
+   */
+  insertEvent(domainId: string, event: NewEvent, detectedAt: Date): Promise<{ id: string; created: boolean }>;
+  /** Create the notification for an event, or return the existing one (idempotent per event). */
+  createNotification(eventId: string, kind: "alert" | "info", title: string, body: string): Promise<string>;
   /** Queue a delivery (idempotent per notification + channel). */
   queueDelivery(notificationId: string, channel: "telegram"): Promise<void>;
 
-  listPendingDeliveries(limit: number, maxAttempts: number): Promise<PendingDelivery[]>;
+  /**
+   * Deliveries that are pending, failed, or stuck in "sending" for longer than
+   * staleSendingMs (the worker died mid-send), with attempts left.
+   */
+  listPendingDeliveries(limit: number, maxAttempts: number, staleSendingMs: number): Promise<PendingDelivery[]>;
   /** Atomically move a delivery to "sending"; false if another worker took it. */
-  claimDelivery(id: string, maxAttempts: number): Promise<boolean>;
+  claimDelivery(id: string, maxAttempts: number, staleSendingMs: number): Promise<boolean>;
   markDelivery(id: string, status: "sent" | "failed" | "skipped", error: string | null): Promise<void>;
 
   getTelegramSettings(): Promise<TelegramSettings>;

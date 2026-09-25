@@ -1,10 +1,12 @@
 import { redirect } from "next/navigation";
 import { getOwner } from "@/lib/auth";
+import { missingRequiredConfig } from "@/lib/env";
 import { LoginForm } from "./login-form";
 
 export const dynamic = "force-dynamic";
 
 export default async function LoginPage() {
+  if (missingRequiredConfig().length > 0) redirect("/setup");
   const { owner, signedIn } = await getOwner();
   if (owner) redirect("/");
   if (signedIn) redirect("/denied");

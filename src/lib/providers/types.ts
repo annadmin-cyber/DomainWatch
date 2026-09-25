@@ -16,11 +16,21 @@ export type LookupResult = {
   /** Why the result is unknown/unsupported (Indonesian, shown in UI) */
   error?: string;
   durationMs: number;
+  /**
+   * No request was sent because the run's time ran out. Such a result is not
+   * recorded; the domain is left for a later (continuation) run.
+   */
+  deferred?: boolean;
+};
+
+export type LookupOptions = {
+  /** Epoch ms after which no new request may start; the result is then "unknown". */
+  deadline?: number;
 };
 
 export interface LookupProvider {
   readonly name: string;
   /** Whether the provider can look up this public suffix (e.g. "co.id"). */
   supports(suffix: string): Promise<boolean>;
-  lookup(fqdn: string, suffix: string): Promise<LookupResult>;
+  lookup(fqdn: string, suffix: string, options?: LookupOptions): Promise<LookupResult>;
 }

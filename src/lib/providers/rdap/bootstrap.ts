@@ -59,12 +59,13 @@ export function snapshotBootstrap(): BootstrapMap {
 }
 
 const CACHE_MS = 12 * 60 * 60 * 1000;
-let cached: { map: BootstrapMap; fetchedAt: number; live: boolean } | null = null;
+/** After a failed fetch, try the live registry again this much sooner. */
+const RETRY_MS = 10 * 60 * 1000;
+type Loaded = { map: BootstrapMap; fetchedAt: number; live: boolean };
+let cached: Loaded | null = null;
+let inflight: Promise<Loaded> | null = null;
 
-export async function loadBootstrap(
-  fetchImpl: typeof fetch = fetch,
-): Promise<{ map: BootstrapMap; live: boolean }> {
-  if (cached && Date.now() - cached.fetchedAt < CACHE_MS) return cached;
+async function fetchBootstrap(fetchImpl: typeof fetch): Promise<Loaded> {
   try {
     const res = await fetchImpl(IANA_BOOTSTRAP_URL, {
       signal: AbortSignal.timeout(10_000),
@@ -74,13 +75,31 @@ export async function loadBootstrap(
     const map = parseBootstrap(await res.json());
     cached = { map, fetchedAt: Date.now(), live: true };
   } catch (err) {
-    console.warn("RDAP bootstrap fetch failed, using bundled snapshot:", err);
-    // Retry the live registry sooner than the normal cache period.
-    cached = { map: snapshotBootstrap(), fetchedAt: Date.now() - CACHE_MS + 10 * 60 * 1000, live: false };
+    // An expired live list is far better than the 14-TLD snapshot, so keep it.
+    const retryAt = Date.now() - CACHE_MS + RETRY_MS;
+    if (cached?.live) {
+      console.warn("RDAP bootstrap fetch failed, keeping the previous IANA list:", err);
+      cached = { ...cached, fetchedAt: retryAt };
+    } else {
+      console.warn("RDAP bootstrap fetch failed, using bundled snapshot:", err);
+      cached = { map: snapshotBootstrap(), fetchedAt: retryAt, live: false };
+    }
   }
   return cached;
 }
 
+export async function loadBootstrap(
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ map: BootstrapMap; live: boolean }> {
+  if (cached && Date.now() - cached.fetchedAt < CACHE_MS) return cached;
+  // Parallel lookups and page renders share one request.
+  inflight ??= fetchBootstrap(fetchImpl).finally(() => {
+    inflight = null;
+  });
+  return inflight;
+}
+
 export function resetBootstrapCache() {
   cached = null;
+  inflight = null;
 }

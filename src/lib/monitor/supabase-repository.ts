@@ -74,7 +74,7 @@ export class SupabaseMonitorRepository implements MonitorRepository {
       .from("monitored_domains")
       .update({ claimed_until: new Date(Date.now() + claimSeconds * 1000).toISOString() })
       .eq("id", id)
-      .or(`claimed_until.is.null,claimed_until.lt.${nowIso}`)
+      .or(`claimed_until.is.null,claimed_until.lt."${nowIso}"`)
       .select(STATE_COLUMNS)
       .maybeSingle();
     if (error) fail("claimOne", error);
@@ -92,7 +92,7 @@ export class SupabaseMonitorRepository implements MonitorRepository {
       .from("monitored_domains")
       .select("id", { count: "exact", head: true })
       .eq("is_active", true)
-      .or(`last_checked_at.is.null,last_checked_at.lt.${dueBefore.toISOString()}`);
+      .or(`last_checked_at.is.null,last_checked_at.lt."${dueBefore.toISOString()}"`);
     if (error) fail("countDue", error);
     return count ?? 0;
   }
@@ -140,7 +140,14 @@ export class SupabaseMonitorRepository implements MonitorRepository {
       )
       .select("id");
     if (error) fail("insertEvent", error);
-    return data && data.length > 0 ? (data[0].id as string) : null;
+    if (data && data.length > 0) return { id: data[0].id as string, created: true };
+    const { data: existing, error: readErr } = await this.db
+      .from("status_events")
+      .select("id")
+      .eq("dedupe_key", event.dedupe_key)
+      .single();
+    if (readErr || !existing) fail("insertEvent (existing)", readErr);
+    return { id: existing.id as string, created: false };
   }
 
   async createNotification(eventId: string, kind: "alert" | "info", title: string, body: string) {
@@ -149,7 +156,14 @@ export class SupabaseMonitorRepository implements MonitorRepository {
       .upsert({ event_id: eventId, kind, title, body }, { onConflict: "event_id", ignoreDuplicates: true })
       .select("id");
     if (error) fail("createNotification", error);
-    return data && data.length > 0 ? (data[0].id as string) : null;
+    if (data && data.length > 0) return data[0].id as string;
+    const { data: existing, error: readErr } = await this.db
+      .from("notifications")
+      .select("id")
+      .eq("event_id", eventId)
+      .single();
+    if (readErr || !existing) fail("createNotification (existing)", readErr);
+    return existing.id as string;
   }
 
   async queueDelivery(notificationId: string, channel: "telegram") {
@@ -159,11 +173,12 @@ export class SupabaseMonitorRepository implements MonitorRepository {
     if (error) fail("queueDelivery", error);
   }
 
-  async listPendingDeliveries(limit: number, maxAttempts: number): Promise<PendingDelivery[]> {
+  async listPendingDeliveries(limit: number, maxAttempts: number, staleSendingMs: number): Promise<PendingDelivery[]> {
+    const staleIso = new Date(Date.now() - staleSendingMs).toISOString();
     const { data, error } = await this.db
       .from("notification_deliveries")
       .select("id, notification_id, attempts, notifications!inner(title, body, is_demo)")
-      .in("status", ["pending", "failed"])
+      .or(`status.in.(pending,failed),and(status.eq.sending,updated_at.lt."${staleIso}")`)
       .lt("attempts", maxAttempts)
       .eq("notifications.is_demo", false)
       .order("updated_at")
@@ -184,20 +199,25 @@ export class SupabaseMonitorRepository implements MonitorRepository {
     });
   }
 
-  async claimDelivery(id: string, maxAttempts: number) {
+  async claimDelivery(id: string, maxAttempts: number, staleSendingMs: number) {
     const { data: current, error: readErr } = await this.db
       .from("notification_deliveries")
-      .select("attempts, status")
+      .select("attempts, status, updated_at")
       .eq("id", id)
       .single();
     if (readErr || !current) return false;
-    if (!["pending", "failed"].includes(current.status as string) || (current.attempts as number) >= maxAttempts) return false;
+    const status = current.status as string;
+    const attempts = current.attempts as number;
+    const stale = status === "sending" && Date.parse(current.updated_at as string) < Date.now() - staleSendingMs;
+    if (!(status === "pending" || status === "failed" || stale) || attempts >= maxAttempts) return false;
+    // Compare-and-set on status, attempts and updated_at so two workers cannot both claim it.
     const { data, error } = await this.db
       .from("notification_deliveries")
-      .update({ status: "sending", attempts: (current.attempts as number) + 1, updated_at: new Date().toISOString() })
+      .update({ status: "sending", attempts: attempts + 1, updated_at: new Date().toISOString() })
       .eq("id", id)
-      .eq("status", current.status as string)
-      .eq("attempts", current.attempts as number)
+      .eq("status", status)
+      .eq("attempts", attempts)
+      .eq("updated_at", current.updated_at as string)
       .select("id");
     if (error) fail("claimDelivery", error);
     return (data?.length ?? 0) === 1;

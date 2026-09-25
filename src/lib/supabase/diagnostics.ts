@@ -54,7 +54,7 @@ export async function checkPublicKey(url: string, key: string, fetchImpl: typeof
       {
         tone: "error",
         text: `Alamat Supabase menjawab dengan kode HTTP ${res.status}`,
-        hint: "Pastikan NEXT_PUBLIC_SUPABASE_URL adalah Project URL dari Supabase > Project Settings > Data API.",
+        hint: "Pastikan NEXT_PUBLIC_SUPABASE_URL adalah Project URL dari Supabase > Project Settings > Data API, persis seperti https://abcd1234.supabase.co tanpa tambahan apa pun di belakangnya.",
       },
     ];
   }
@@ -159,6 +159,24 @@ async function checkSecretKey(): Promise<DiagnosticLine[]> {
   return describeSecretKeyCheck(res);
 }
 
+/** Warns when NEXT_PUBLIC_SUPABASE_URL carries an API path that the app ignores. */
+export function urlLines(raw = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim()): DiagnosticLine[] {
+  if (!raw) return [];
+  try {
+    const u = new URL(raw);
+    if (u.pathname.replace(/\/+$/, "") === "") return [];
+    return [
+      {
+        tone: "warning",
+        text: `NEXT_PUBLIC_SUPABASE_URL berisi tambahan "${u.pathname}" di belakang alamat`,
+        hint: `Aplikasi memakai ${u.origin} saja. Sebaiknya ubah nilainya di Vercel menjadi persis ${u.origin}, lalu Redeploy.`,
+      },
+    ];
+  } catch {
+    return [];
+  }
+}
+
 /** Runs both checks. Never throws; returns null when the public config is missing. */
 export async function diagnoseSupabase(): Promise<SupabaseDiagnostics | null> {
   const cfg = publicSupabaseConfig();
@@ -174,5 +192,5 @@ export async function diagnoseSupabase(): Promise<SupabaseDiagnostics | null> {
     safely(() => checkPublicKey(cfg.url, cfg.key)),
     safely(checkSecretKey),
   ]);
-  return { projectRef: projectRefOf(cfg.url), lines: [...publicLines, ...secretLines] };
+  return { projectRef: projectRefOf(cfg.url), lines: [...urlLines(), ...publicLines, ...secretLines] };
 }

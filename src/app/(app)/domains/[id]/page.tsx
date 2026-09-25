@@ -132,6 +132,10 @@ export default async function DomainDetailPage(props: PageProps<"/domains/[id]">
         <h2 className="mb-4 font-semibold">Ubah pengaturan domain</h2>
         <ActionForm action={updateDomain} className="space-y-4">
           <input type="hidden" name="id" value={id} />
+          {/* Only variants shown as ticked here can be removed by unticking them. */}
+          {variants.map((v) => (
+            <input key={v.suffix} type="hidden" name="shown_suffixes" value={v.suffix} />
+          ))}
           <SuffixPicker items={support.items} selected={variants.map((v) => v.suffix)} exclude={domain.suffix} />
           <div className="max-w-md">
             <label htmlFor="notes" className="label">

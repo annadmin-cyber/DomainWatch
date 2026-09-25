@@ -3,8 +3,9 @@
  * the browser bundle; everything else stays on the server.
  */
 
+/** Same rule as supabase-js: starts with http(s):// and parses as a URL. */
 function isHttpUrl(value: string | undefined): boolean {
-  if (!value) return false;
+  if (!value || !/^https?:\/\//i.test(value)) return false;
   try {
     const { protocol } = new URL(value);
     return protocol === "https:" || protocol === "http:";
@@ -13,12 +14,25 @@ function isHttpUrl(value: string | undefined): boolean {
   }
 }
 
+/**
+ * The Supabase clients need the bare project URL (https://<ref>.supabase.co).
+ * A copied API endpoint such as https://<ref>.supabase.co/rest/v1/ is reduced
+ * to it, because the clients append those paths themselves; any other path is
+ * kept as entered.
+ */
+export function normalizeSupabaseUrl(value: string): string {
+  const u = new URL(value);
+  const path = u.pathname.replace(/\/+$/, "");
+  if (path === "" || /^\/(rest|auth|storage|realtime|functions|graphql)\/v1$/i.test(path)) return u.origin;
+  return `${u.origin}${path}`;
+}
+
 /** Supabase URL and publishable key, or null when missing or not a valid http(s) URL. */
 export function publicSupabaseConfig(): { url: string; key: string } | null {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
   const key = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY?.trim();
   if (!url || !key || !isHttpUrl(url)) return null;
-  return { url, key };
+  return { url: normalizeSupabaseUrl(url), key };
 }
 
 export type ConfigItem = {

@@ -56,7 +56,7 @@ describe("RDAP provider", () => {
     expect((await provider(fn).lookup("examplebrand.net", "net")).status).toBe("unknown");
   });
 
-  it("returns unknown (not unregistered) on timeouts, after a limited retry", async () => {
+  it("returns unknown (not unregistered) on timeouts, without retrying the timeout", async () => {
     const { fn, calls } = mockFetch(() => {
       const err = new Error("timed out");
       err.name = "TimeoutError";
@@ -65,7 +65,27 @@ describe("RDAP provider", () => {
     const r = await provider(fn, 2).lookup("examplebrand.org", "org");
     expect(r.status).toBe("unknown");
     expect(r.error).toMatch(/timeout/);
-    expect(calls).toHaveLength(2);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("skips a registry for the rest of the run after repeated failures (circuit breaker)", async () => {
+    const { fn, calls } = mockFetch(() => new Response("down", { status: 503 }));
+    const p = provider(fn, 1);
+    for (const name of ["a", "b", "c", "d", "e"]) {
+      expect((await p.lookup(`${name}.org`, "org")).status).toBe("unknown");
+    }
+    expect(calls).toHaveLength(3);
+    // Other registries are unaffected.
+    const other = await p.lookup("a.net", "net");
+    expect(other.status).toBe("unknown");
+    expect(calls).toHaveLength(4);
+  });
+
+  it("stops before the deadline instead of starting a request", async () => {
+    const { fn, calls } = mockFetch(() => json(404, {}));
+    const r = await provider(fn).lookup("examplebrand.org", "org", { deadline: Date.now() + 500 });
+    expect(r.status).toBe("unknown");
+    expect(calls).toHaveLength(0);
   });
 
   it("returns unknown on rate limiting and server errors", async () => {

@@ -56,6 +56,9 @@ export class RdapProvider implements LookupProvider {
   private sleep: (ms: number) => Promise<void>;
   private limiter: HostLimiter;
   private bootstrapOverride?: BootstrapMap;
+  /** Consecutive transient failures per host (circuit breaker, per instance = per run). */
+  private hostFailures = new Map<string, number>();
+  static readonly BREAKER_THRESHOLD = 3;
 
   constructor(opts: RdapOptions = {}) {
     this.fetchImpl = opts.fetchImpl ?? fetch;
@@ -101,18 +104,25 @@ export class RdapProvider implements LookupProvider {
     let lastHttp: number | undefined;
     for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
       const outcome = await this.limiter.run(host, async () => {
+        const stop = (error: string) => ({
+          kind: "retry" as const,
+          httpStatus: undefined,
+          retryAfterMs: undefined,
+          error,
+          stop: true,
+        });
+        // A registry that keeps failing is skipped for the rest of this run so
+        // it cannot tie up every worker; its domains are reported as unknown.
+        if ((this.hostFailures.get(host) ?? 0) >= RdapProvider.BREAKER_THRESHOLD) {
+          return stop(`Server RDAP ${host} gagal merespons berulang kali, jadi dilewati sementara pada proses ini.`);
+        }
         // Waiting in the per-host queue may have used up the remaining time.
         const left = timeLeft();
-        if (left < 2_000) {
-          return {
-            kind: "retry" as const,
-            httpStatus: undefined,
-            retryAfterMs: undefined,
-            error: "Batas waktu proses tercapai sebelum pengecekan dimulai.",
-            stop: true,
-          };
-        }
-        return this.once(url, fqdn, Math.min(this.timeoutMs, left));
+        if (left < 2_000) return stop("Batas waktu proses tercapai sebelum pengecekan dimulai.");
+        const result = await this.once(url, fqdn, Math.min(this.timeoutMs, left));
+        if (result.kind === "final") this.hostFailures.set(host, 0);
+        else this.hostFailures.set(host, (this.hostFailures.get(host) ?? 0) + 1);
+        return result;
       });
       lastHttp = outcome.httpStatus;
       if (outcome.kind === "final") {
@@ -120,6 +130,8 @@ export class RdapProvider implements LookupProvider {
       }
       lastError = outcome.error;
       if ("stop" in outcome && outcome.stop) break;
+      // A timeout already cost the full timeout; retrying it would mostly stall the run.
+      if ("timedOut" in outcome && outcome.timedOut) break;
       if (attempt < this.maxAttempts) {
         const wait = outcome.retryAfterMs ?? 1_500 * attempt;
         // Do not stall the whole run for one registry, and never retry past the deadline.
@@ -142,7 +154,7 @@ export class RdapProvider implements LookupProvider {
     timeoutMs: number,
   ): Promise<
     | { kind: "final"; httpStatus?: number; result: Omit<LookupResult, "source" | "durationMs"> }
-    | { kind: "retry"; httpStatus?: number; error: string; retryAfterMs?: number }
+    | { kind: "retry"; httpStatus?: number; error: string; retryAfterMs?: number; timedOut?: boolean }
   > {
     let res: Response;
     try {
@@ -156,6 +168,7 @@ export class RdapProvider implements LookupProvider {
       const timedOut = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
       return {
         kind: "retry",
+        timedOut,
         error: timedOut
           ? "Server RDAP tidak merespons tepat waktu (timeout)."
           : "Gagal terhubung ke server RDAP.",

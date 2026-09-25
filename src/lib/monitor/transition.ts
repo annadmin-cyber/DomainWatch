@@ -66,12 +66,21 @@ export const BASELINE_REGISTERED_LABEL = "Sudah terdaftar saat pemantauan dimula
 export const BASELINE_UNREGISTERED_LABEL = "Belum terdaftar saat pemantauan dimulai";
 
 /**
- * A registered result that contradicts a previously confirmed "unregistered"
- * must be confirmed by a second lookup before any alert is created.
+ * Any conclusive result that contradicts the last conclusive status must be
+ * confirmed by a second lookup before it is accepted. This prevents a single
+ * spurious answer from creating (or later re-arming) a registration alert.
  */
 export function needsConfirmation(state: DomainState, primary: LookupResult): boolean {
-  return primary.status === "registered" && state.last_conclusive_status === "unregistered";
+  if (primary.status !== "registered" && primary.status !== "unregistered") return false;
+  return state.last_conclusive_status !== null && state.last_conclusive_status !== primary.status;
 }
+
+/**
+ * A previous "unregistered" counts as directly confirmed only if it came from
+ * the immediately preceding check and that check was recent (daily schedule
+ * plus Vercel Hobby timing jitter). Otherwise the change time is uncertain.
+ */
+export const DIRECT_CONFIRMATION_MAX_AGE_MS = 30 * 60 * 60 * 1000;
 
 function regDateSentence(date: string | null | undefined): string {
   return date ? ` Tanggal registrasi menurut sumber data: ${formatDate(date)}.` : "";
@@ -115,9 +124,9 @@ export function decideTransition(
     };
   }
 
-  if (needsConfirmation(state, primary) && confirmation?.status !== "registered") {
-    const msg =
-      "Hasil terbaru menunjukkan terdaftar, tetapi pemeriksaan ulang tidak mengonfirmasinya. Akan dicek lagi pada jadwal berikutnya.";
+  if (needsConfirmation(state, primary) && confirmation?.status !== primary.status) {
+    const label = primary.status === "registered" ? "terdaftar" : "belum terdaftar";
+    const msg = `Hasil terbaru menunjukkan ${label}, tetapi pemeriksaan ulang tidak mengonfirmasinya. Akan dicek lagi pada jadwal berikutnya.`;
     return {
       update: {
         ...base,
@@ -130,7 +139,7 @@ export function decideTransition(
     };
   }
 
-  const result: Conclusive = primary.status;
+  const result: Conclusive = primary.status as Conclusive;
   const regDate = result === "registered" ? (confirmation?.registrationDate ?? primary.registrationDate ?? null) : null;
   const update: DomainUpdate = {
     ...base,
@@ -192,7 +201,10 @@ export function decideTransition(
         },
       };
     }
-    const directlyConfirmed = state.status === "unregistered";
+    const directlyConfirmed =
+      state.status === "unregistered" &&
+      prevAt !== null &&
+      now.getTime() - Date.parse(prevAt) <= DIRECT_CONFIRMATION_MAX_AGE_MS;
     if (directlyConfirmed) {
       return {
         update,
@@ -225,7 +237,7 @@ export function decideTransition(
         title: `${state.fqdn} baru terdeteksi sebagai terdaftar`,
         message:
           `${state.fqdn} baru terdeteksi sebagai terdaftar. Terakhir dikonfirmasi belum terdaftar pada ${formatDateTime(prevAt)}, ` +
-          `tetapi pemeriksaan sesudahnya tidak berhasil sehingga waktu perubahan pastinya tidak diketahui. ` +
+          `tetapi sesudahnya tidak ada pemeriksaan yang berhasil, sehingga waktu perubahan pastinya tidak diketahui. ` +
           `Terdeteksi pada ${formatDateTime(now)}.` +
           regDateSentence(regDate),
         dedupe_key: dedupe,

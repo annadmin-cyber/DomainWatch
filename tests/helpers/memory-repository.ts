@@ -19,7 +19,16 @@ export class MemoryRepository implements MonitorRepository {
   checks: { domainId: string; result: LookupResult; confirmation: boolean }[] = [];
   events = new Map<string, NewEvent & { id: string; domainId: string }>(); // by dedupe key
   notifications = new Map<string, { id: string; eventId: string; kind: string; title: string; body: string }>();
-  deliveries = new Map<string, { id: string; notificationId: string; status: string; attempts: number; error: string | null }>();
+  deliveries = new Map<
+    string,
+    { id: string; notificationId: string; status: string; attempts: number; error: string | null; updatedAt: number }
+  >();
+  /** Test hook: throw from the named method once. */
+  failOnce = new Set<string>();
+
+  private maybeFail(method: string) {
+    if (this.failOnce.delete(method)) throw new Error(`simulated ${method} failure`);
+  }
   lock: { runId: string | null; until: number } = { runId: null, until: 0 };
   telegram: TelegramSettings = { enabled: false, chatId: null };
   clock: () => number = () => Date.now();
@@ -129,42 +138,54 @@ export class MemoryRepository implements MonitorRepository {
     Object.assign(r, update, { claimed_until: null });
   }
   async insertEvent(domainId: string, event: NewEvent) {
-    if (this.events.has(event.dedupe_key)) return null;
+    this.maybeFail("insertEvent");
+    const existing = this.events.get(event.dedupe_key);
+    if (existing) return { id: existing.id, created: false };
     const id = randomUUID();
     this.events.set(event.dedupe_key, { ...event, id, domainId });
-    return id;
+    return { id, created: true };
   }
   async createNotification(eventId: string, kind: "alert" | "info", title: string, body: string) {
-    if ([...this.notifications.values()].some((n) => n.eventId === eventId)) return null;
+    this.maybeFail("createNotification");
+    const existing = [...this.notifications.values()].find((n) => n.eventId === eventId);
+    if (existing) return existing.id;
     const id = randomUUID();
     this.notifications.set(id, { id, eventId, kind, title, body });
     return id;
   }
   async queueDelivery(notificationId: string) {
+    this.maybeFail("queueDelivery");
     if ([...this.deliveries.values()].some((d) => d.notificationId === notificationId)) return;
     const id = randomUUID();
-    this.deliveries.set(id, { id, notificationId, status: "pending", attempts: 0, error: null });
+    this.deliveries.set(id, { id, notificationId, status: "pending", attempts: 0, error: null, updatedAt: this.clock() });
   }
-  async listPendingDeliveries(limit: number, maxAttempts: number): Promise<PendingDelivery[]> {
+  private retryable(d: { status: string; attempts: number; updatedAt: number }, maxAttempts: number, staleMs: number) {
+    const stale = d.status === "sending" && d.updatedAt < this.clock() - staleMs;
+    return (d.status === "pending" || d.status === "failed" || stale) && d.attempts < maxAttempts;
+  }
+  async listPendingDeliveries(limit: number, maxAttempts: number, staleSendingMs: number): Promise<PendingDelivery[]> {
     return [...this.deliveries.values()]
-      .filter((d) => ["pending", "failed"].includes(d.status) && d.attempts < maxAttempts)
+      .filter((d) => this.retryable(d, maxAttempts, staleSendingMs))
       .slice(0, limit)
       .map((d) => {
         const n = this.notifications.get(d.notificationId)!;
         return { id: d.id, notification_id: d.notificationId, attempts: d.attempts, title: n.title, body: n.body };
       });
   }
-  async claimDelivery(id: string, maxAttempts: number) {
+  async claimDelivery(id: string, maxAttempts: number, staleSendingMs: number) {
     const d = this.deliveries.get(id);
-    if (!d || !["pending", "failed"].includes(d.status) || d.attempts >= maxAttempts) return false;
+    if (!d || !this.retryable(d, maxAttempts, staleSendingMs)) return false;
     d.status = "sending";
     d.attempts++;
+    d.updatedAt = this.clock();
     return true;
   }
   async markDelivery(id: string, status: "sent" | "failed" | "skipped", error: string | null) {
+    this.maybeFail("markDelivery");
     const d = this.deliveries.get(id)!;
     d.status = status;
     d.error = error;
+    d.updatedAt = this.clock();
   }
   async getTelegramSettings() {
     return this.telegram;

@@ -66,7 +66,8 @@ export async function POST(request: Request) {
     );
   }
   try {
-    const outcome = await checkDomain(deps, state, null);
+    // Manual checks run inside this request, so keep them well under maxDuration.
+    const outcome = await checkDomain(deps, state, null, { deadline: Date.now() + 60_000 });
     after(() => deliverPending(deps).then(() => undefined));
     return NextResponse.json({ ok: true, status: outcome.status, event: outcome.event });
   } catch (err) {

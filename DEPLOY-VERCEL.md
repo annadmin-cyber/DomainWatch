@@ -44,11 +44,14 @@ Kode sudah dikirim ke repository https://github.com/annadmin-cyber/DomainWatch d
 
 ## Langkah 4 — Pasang skema database dan aturan akses
 
-1. Di GitHub, buka file `supabase/migrations/0001_init.sql`, klik ikon **Copy raw file** (dua kotak bertumpuk) di kanan atas isi file.
+Folder `supabase/migrations/` berisi file SQL bernomor. Jalankan **semuanya, berurutan** (`0001_init.sql`, lalu `0002_hardening.sql`, dan seterusnya jika nanti ada file baru). Untuk setiap file:
+
+1. Di GitHub, buka file tersebut, klik ikon **Copy raw file** (dua kotak bertumpuk) di kanan atas isi file.
 2. Di Supabase, menu kiri: **SQL Editor** > **New query**.
 3. Tempel (Ctrl+V / Cmd+V) seluruh isi, lalu klik **Run**.
-4. Hasil yang diharapkan: **"Success. No rows returned"**. Jika muncul peringatan tentang operasi berbahaya ("destructive operation"), itu karena ada perintah `drop policy if exists`; klik **Run this query** untuk melanjutkan.
-5. Cek: menu **Table Editor** sekarang berisi tabel `domains`, `monitored_domains`, `notifications`, dan lainnya.
+4. Hasil yang diharapkan: **"Success. No rows returned"**. Jika muncul peringatan tentang operasi berbahaya ("destructive operation"), itu karena ada perintah `drop ... if exists`; klik **Run this query** untuk melanjutkan.
+
+Semua file aman dijalankan ulang. Cek: menu **Table Editor** sekarang berisi tabel `domains`, `monitored_domains`, `notifications`, dan lainnya.
 
 ## Langkah 5 — Buat akun login pemilik
 
@@ -133,7 +136,7 @@ Jadwal: setiap hari pukul 01.00 UTC (sekitar **08.00–08.59 WIB**; paket Hobby 
 Setiap perubahan kode yang masuk ke branch `main` di GitHub otomatis di-deploy ulang oleh Vercel.
 
 - Jika Claude membuat Pull Request baru: buka di GitHub, klik **Merge pull request**. Tunggu 1–3 menit, lalu cek **Deployments** di Vercel berstatus **Ready**.
-- Jika ada file SQL baru di `supabase/migrations/`, jalankan file itu di Supabase SQL Editor seperti Langkah 4 (sebelum atau segera setelah merge).
+- Jika ada file SQL baru di `supabase/migrations/`, jalankan file itu di Supabase SQL Editor seperti Langkah 4 (segera setelah merge). Claude akan menyebutkan file mana yang baru.
 - Jika perlu kembali ke versi sebelumnya: Vercel > **Deployments** > pilih deployment lama > titik tiga > **Promote to Production**.
 
 ## Catatan batasan (paket gratis)

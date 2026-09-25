@@ -106,8 +106,8 @@ describe("change detection", () => {
     advance(24);
     provider.set("examplebrand.net", "registered");
     // Two workers processing the same stale state.
-    await checkDomain(deps, before, null, 0);
-    await checkDomain(deps, before, null, 0);
+    await checkDomain(deps, before, null, { confirmDelayMs: 0 });
+    await checkDomain(deps, before, null, { confirmDelayMs: 0 });
     expect(alerts()).toHaveLength(1);
     expect(repo.notifications.size).toBe(1);
     expect(repo.deliveries.size).toBe(1);
@@ -290,5 +290,105 @@ describe("Telegram delivery", () => {
     expect(d.attempts).toBe(3);
     expect(d.error).toContain("chat not found");
     expect(tg.sent).toHaveLength(3);
+  });
+});
+
+describe("robustness fixes", () => {
+  it("completes the notification chain on retry if it failed after the event was stored", async () => {
+    const id = repo.addDomain("examplebrand.net");
+    provider.set("examplebrand.net", "unregistered");
+    await runMonitor(deps, { trigger: "cron" });
+    advance(24);
+    provider.set("examplebrand.net", "registered");
+    repo.failOnce.add("createNotification");
+    await runMonitor(deps, { trigger: "cron" });
+    // Event stored, notification missing, domain state unchanged.
+    expect(alerts()).toHaveLength(1);
+    expect(repo.notifications.size).toBe(0);
+    expect(repo.row(id).last_conclusive_status).toBe("unregistered");
+
+    advance(4);
+    await runMonitor(deps, { trigger: "cron" });
+    expect(alerts()).toHaveLength(1);
+    expect(repo.notifications.size).toBe(1);
+    expect(repo.deliveries.size).toBe(1);
+    expect(repo.row(id).status).toBe("registered");
+  });
+
+  it("requires confirmation before accepting registered -> unregistered", async () => {
+    const id = repo.addDomain("examplebrand.net");
+    provider.set("examplebrand.net", "registered");
+    await runMonitor(deps, { trigger: "cron" });
+    advance(24);
+    // One spurious 404 followed by a registered confirmation.
+    provider.queue("examplebrand.net", "unregistered", "registered");
+    await runMonitor(deps, { trigger: "cron" });
+    expect(repo.row(id).status).toBe("unknown");
+    expect(repo.row(id).last_conclusive_status).toBe("registered");
+    expect(repo.row(id).last_confirmed_unregistered_at).toBeNull();
+    // Next day registered again: no alert must be produced.
+    advance(24);
+    await runMonitor(deps, { trigger: "cron" });
+    expect(alerts()).toHaveLength(0);
+    expect([...repo.events.values()].some((e) => e.event_type === "became_unregistered")).toBe(false);
+  });
+
+  it("uses 'newly detected' wording when the last unregistered confirmation is old", async () => {
+    const id = repo.addDomain("examplebrand.net");
+    provider.set("examplebrand.net", "unregistered");
+    await runMonitor(deps, { trigger: "cron" });
+    repo.row(id).is_active = false;
+    advance(24 * 10);
+    repo.row(id).is_active = true;
+    provider.set("examplebrand.net", "registered");
+    await runMonitor(deps, { trigger: "cron" });
+    expect(alerts()[0].event_type).toBe("newly_detected_registered");
+  });
+
+  it("a manual check during the day does not make the next daily run skip the domain", async () => {
+    repo.addDomain("examplebrand.net");
+    provider.set("examplebrand.net", "registered");
+    advance(12); // 13:00 UTC
+    await runMonitor(deps, { trigger: "manual", forceAll: true });
+    advance(12); // next 01:00 UTC
+    const out = await runMonitor(deps, { trigger: "cron" });
+    expect(out.checked).toBe(1);
+  });
+
+  it("retries a Telegram delivery stuck in 'sending' after the stale period", async () => {
+    const tg = { sent: 0 };
+    const fetchImpl = (async () => {
+      tg.sent++;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }) as typeof fetch;
+    repo.telegram = { enabled: true, chatId: "1" };
+    deps = { ...deps, telegramToken: "T", fetchImpl };
+    repo.addDomain("examplebrand.net");
+    provider.set("examplebrand.net", "unregistered");
+    await runMonitor(deps, { trigger: "cron" });
+    advance(24);
+    provider.set("examplebrand.net", "registered");
+    repo.failOnce.add("markDelivery"); // worker "dies" after sending
+    await runMonitor(deps, { trigger: "cron" }).catch(() => {});
+    const d = [...repo.deliveries.values()][0];
+    expect(d.status).toBe("sending");
+    await deliverPending(deps);
+    expect(d.status).toBe("sending"); // not stale yet
+    advance(1);
+    await deliverPending(deps);
+    expect(d.status).toBe("sent");
+    expect(d.attempts).toBe(2);
+  });
+
+  it("always closes the run and releases the lock, even when finishing fails midway", async () => {
+    repo.addDomain("examplebrand.net");
+    provider.set("examplebrand.net", "registered");
+    repo.countDue = async () => {
+      throw new Error("db down");
+    };
+    const out = await runMonitor(deps, { trigger: "cron" });
+    expect(out.checked).toBe(1);
+    expect(repo.lock.runId).toBeNull();
+    expect([...repo.runs.values()][0].status).not.toBe("running");
   });
 });

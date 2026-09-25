@@ -18,9 +18,14 @@ export type LookupResult = {
   durationMs: number;
 };
 
+export type LookupOptions = {
+  /** Epoch ms after which no new request may start; the result is then "unknown". */
+  deadline?: number;
+};
+
 export interface LookupProvider {
   readonly name: string;
   /** Whether the provider can look up this public suffix (e.g. "co.id"). */
   supports(suffix: string): Promise<boolean>;
-  lookup(fqdn: string, suffix: string): Promise<LookupResult>;
+  lookup(fqdn: string, suffix: string, options?: LookupOptions): Promise<LookupResult>;
 }

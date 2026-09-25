@@ -23,9 +23,11 @@ async function as<T>(role: "anon" | "authenticated" | "service_role", sub: strin
 beforeAll(async () => {
   db = new PGlite();
   await db.exec(readFileSync("tests/helpers/supabase-stub.sql", "utf8"));
-  const migration = readFileSync("supabase/migrations/0001_init.sql", "utf8");
-  await db.exec(migration);
-  await db.exec(migration); // must be re-runnable
+  const migrations = ["0001_init.sql", "0002_hardening.sql"].map((f) =>
+    readFileSync(`supabase/migrations/${f}`, "utf8"),
+  );
+  for (const m of migrations) await db.exec(m);
+  for (const m of migrations) await db.exec(m); // must be re-runnable
   await db.exec(`insert into auth.users (id, email) values ('${OWNER}', 'owner@example.com'), ('${STRANGER}', 'x@example.com');`);
   await db.exec(readFileSync("supabase/setup-owner.sql", "utf8"));
 }, 60_000);
@@ -93,6 +95,17 @@ describe("row level security", () => {
     ).rejects.toThrow(/permission denied/);
   });
 
+  it("denies TRUNCATE (which bypasses RLS) to API roles", async () => {
+    await expect(as("authenticated", STRANGER, () => db.exec(`truncate public.app_settings cascade`))).rejects.toThrow(
+      /permission denied/,
+    );
+    await expect(as("authenticated", OWNER, () => db.exec(`truncate public.domains cascade`))).rejects.toThrow(
+      /permission denied/,
+    );
+    const s = await db.query("select * from public.app_settings");
+    expect(s.rows).toHaveLength(1);
+  });
+
   it("denies authenticated users the server-only functions", async () => {
     await expect(
       as("authenticated", OWNER, () => db.query(`select public.hit_rate_limit('x', 1, 60)`)),
@@ -100,6 +113,18 @@ describe("row level security", () => {
     await expect(
       as("authenticated", OWNER, () => db.query(`select * from public.claim_due_domains(10, now(), 60)`)),
     ).rejects.toThrow(/permission denied/);
+  });
+});
+
+describe("ownership", () => {
+  it("keeps monitoring data when an old owner account is deleted", async () => {
+    const OLD = "33333333-3333-3333-3333-333333333333";
+    await db.exec(`insert into auth.users (id, email) values ('${OLD}', 'old@example.com')`);
+    await db.exec(`insert into public.domains (owner_id, base_domain, label, suffix) values ('${OLD}', 'keepme.com', 'keepme', 'com')`);
+    await db.exec(`delete from auth.users where id = '${OLD}'`);
+    const r = await db.query<{ owner_id: string | null }>(`select owner_id from public.domains where base_domain = 'keepme.com'`);
+    expect(r.rows).toEqual([{ owner_id: null }]);
+    await db.exec(`delete from public.domains where base_domain = 'keepme.com'`);
   });
 });
 

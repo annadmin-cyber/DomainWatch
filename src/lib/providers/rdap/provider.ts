@@ -1,5 +1,5 @@
 import { tldOf } from "@/lib/domains/extensions";
-import type { LookupProvider, LookupResult } from "@/lib/providers/types";
+import type { LookupOptions, LookupProvider, LookupResult } from "@/lib/providers/types";
 import { loadBootstrap, type BootstrapMap } from "./bootstrap";
 
 export type RdapOptions = {
@@ -80,8 +80,10 @@ export class RdapProvider implements LookupProvider {
     return (await this.baseUrlFor(suffix)) !== null;
   }
 
-  async lookup(fqdn: string, suffix: string): Promise<LookupResult> {
+  async lookup(fqdn: string, suffix: string, options: LookupOptions = {}): Promise<LookupResult> {
     const started = Date.now();
+    const deadline = options.deadline ?? Number.POSITIVE_INFINITY;
+    const timeLeft = () => deadline - Date.now();
     const base = await this.baseUrlFor(suffix);
     if (!base) {
       return {
@@ -98,15 +100,30 @@ export class RdapProvider implements LookupProvider {
     let lastError = "";
     let lastHttp: number | undefined;
     for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
-      const outcome = await this.limiter.run(host, () => this.once(url, fqdn));
+      const outcome = await this.limiter.run(host, async () => {
+        // Waiting in the per-host queue may have used up the remaining time.
+        const left = timeLeft();
+        if (left < 2_000) {
+          return {
+            kind: "retry" as const,
+            httpStatus: undefined,
+            retryAfterMs: undefined,
+            error: "Batas waktu proses tercapai sebelum pengecekan dimulai.",
+            stop: true,
+          };
+        }
+        return this.once(url, fqdn, Math.min(this.timeoutMs, left));
+      });
       lastHttp = outcome.httpStatus;
       if (outcome.kind === "final") {
         return { ...outcome.result, source, durationMs: Date.now() - started };
       }
       lastError = outcome.error;
+      if ("stop" in outcome && outcome.stop) break;
       if (attempt < this.maxAttempts) {
         const wait = outcome.retryAfterMs ?? 1_500 * attempt;
-        if (wait > 10_000) break; // do not stall the whole run for one registry
+        // Do not stall the whole run for one registry, and never retry past the deadline.
+        if (wait > 10_000 || timeLeft() - wait < 5_000) break;
         await this.sleep(wait);
       }
     }
@@ -122,6 +139,7 @@ export class RdapProvider implements LookupProvider {
   private async once(
     url: string,
     fqdn: string,
+    timeoutMs: number,
   ): Promise<
     | { kind: "final"; httpStatus?: number; result: Omit<LookupResult, "source" | "durationMs"> }
     | { kind: "retry"; httpStatus?: number; error: string; retryAfterMs?: number }
@@ -130,7 +148,7 @@ export class RdapProvider implements LookupProvider {
     try {
       res = await this.fetchImpl(url, {
         headers: { accept: "application/rdap+json, application/json" },
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal: AbortSignal.timeout(timeoutMs),
         redirect: "follow",
         cache: "no-store",
       });

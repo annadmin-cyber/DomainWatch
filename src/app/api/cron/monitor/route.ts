@@ -35,6 +35,7 @@ export async function GET(request: Request) {
       trigger: depth > 0 ? "continuation" : "cron",
       chainId,
       depth,
+      willContinue: depth < MAX_CHAIN_DEPTH,
     });
     console.log("DomainWatch monitor run", JSON.stringify(outcome));
     if (outcome.status === "partial" && outcome.remaining > 0 && outcome.checked > 0 && depth < MAX_CHAIN_DEPTH) {

@@ -1,0 +1,24 @@
+import { createServerClient } from "@supabase/ssr";
+import { cookies } from "next/headers";
+import { publicSupabaseConfig } from "@/lib/env";
+
+/** Supabase client acting as the signed-in user (RLS applies). */
+export async function createClient() {
+  const cfg = publicSupabaseConfig();
+  if (!cfg) throw new Error("Supabase is not configured");
+  const cookieStore = await cookies();
+  return createServerClient(cfg.url, cfg.key, {
+    cookies: {
+      getAll() {
+        return cookieStore.getAll();
+      },
+      setAll(cookiesToSet) {
+        try {
+          cookiesToSet.forEach(({ name, value, options }) => cookieStore.set(name, value, options));
+        } catch {
+          // Called from a Server Component; the proxy refreshes the session instead.
+        }
+      },
+    },
+  });
+}

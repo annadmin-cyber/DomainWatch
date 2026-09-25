@@ -1,7 +1,10 @@
 "use client";
 
-import { useActionState } from "react";
+import { createContext, startTransition, useActionState } from "react";
 import type { ActionState } from "@/app/(app)/actions";
+
+/** Pending state for SubmitButton inside an ActionForm (useFormStatus does not see it). */
+export const ActionFormPending = createContext(false);
 
 /** Form wrapper that shows the success/error message returned by a server action. */
 export function ActionForm({
@@ -19,11 +22,20 @@ export function ActionForm({
   return (
     <form
       action={formAction}
+      // React resets a form after every function action, even when it returns an
+      // error. Submitting through startTransition keeps what the user typed; the
+      // key below still clears the form after a success when asked to.
+      // (Without JavaScript the plain `action` above is used.)
+      onSubmit={(e) => {
+        e.preventDefault();
+        const formData = new FormData(e.currentTarget);
+        startTransition(() => formAction(formData));
+      }}
       className={className}
       key={resetOnSuccess && state.ok ? String(state.message) : undefined}
       aria-busy={pending}
     >
-      {children}
+      <ActionFormPending value={pending}>{children}</ActionFormPending>
       {state.message ? (
         <p
           role={state.ok ? "status" : "alert"}

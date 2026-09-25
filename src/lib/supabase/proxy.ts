@@ -22,22 +22,29 @@ export async function updateSession(request: NextRequest) {
   }
 
   let response = NextResponse.next({ request });
-  const supabase = createServerClient(cfg.url, cfg.key, {
-    cookies: {
-      getAll() {
-        return request.cookies.getAll();
+  let signedIn = false;
+  try {
+    const supabase = createServerClient(cfg.url, cfg.key, {
+      cookies: {
+        getAll() {
+          return request.cookies.getAll();
+        },
+        setAll(cookiesToSet) {
+          cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value));
+          response = NextResponse.next({ request });
+          cookiesToSet.forEach(({ name, value, options }) => response.cookies.set(name, value, options));
+        },
       },
-      setAll(cookiesToSet) {
-        cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value));
-        response = NextResponse.next({ request });
-        cookiesToSet.forEach(({ name, value, options }) => response.cookies.set(name, value, options));
-      },
-    },
-  });
+    });
 
-  // Do not run code between createServerClient and getClaims().
-  const { data } = await supabase.auth.getClaims();
-  const signedIn = Boolean(data?.claims?.sub);
+    // Do not run code between createServerClient and getClaims().
+    const { data } = await supabase.auth.getClaims();
+    signedIn = Boolean(data?.claims?.sub);
+  } catch (err) {
+    // A Supabase outage or bad configuration must not crash every page:
+    // continue as signed out. Pages and API routes verify access themselves.
+    console.error("Session refresh failed:", err instanceof Error ? err.message : err);
+  }
 
   if (pathname.startsWith("/api")) return response;
 

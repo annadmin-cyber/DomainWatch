@@ -1,6 +1,8 @@
 "use client";
 
+import { useContext } from "react";
 import { useFormStatus } from "react-dom";
+import { ActionFormPending } from "@/components/action-form";
 
 export function SubmitButton({
   children,
@@ -13,7 +15,8 @@ export function SubmitButton({
   className?: string;
   confirm?: string;
 }) {
-  const { pending } = useFormStatus();
+  const status = useFormStatus();
+  const pending = useContext(ActionFormPending) || status.pending;
   return (
     <button
       type="submit"

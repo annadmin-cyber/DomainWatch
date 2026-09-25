@@ -1,6 +1,12 @@
-import { describe, expect, it } from "vitest";
-import { parseBootstrap, snapshotBootstrap } from "@/lib/providers/rdap/bootstrap";
-import { RdapProvider } from "@/lib/providers/rdap/provider";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  IANA_BOOTSTRAP_URL,
+  loadBootstrap,
+  parseBootstrap,
+  resetBootstrapCache,
+  snapshotBootstrap,
+} from "@/lib/providers/rdap/bootstrap";
+import { parseRetryAfter, RdapProvider } from "@/lib/providers/rdap/provider";
 
 const bootstrap = snapshotBootstrap();
 const noSleep = async () => {};
@@ -56,6 +62,38 @@ describe("RDAP provider", () => {
     expect((await provider(fn).lookup("examplebrand.net", "net")).status).toBe("unknown");
   });
 
+  it("only accepts a 404 that looks like an RDAP answer", async () => {
+    const cases: [Response, string][] = [
+      [new Response("404 page not found", { status: 404, headers: { "content-type": "text/plain" } }), "unknown"],
+      [json(404, { message: "Not Found" }, "application/json"), "unknown"],
+      [json(404, { errorCode: 404, title: "Not Found" }, "application/json"), "unregistered"],
+      [json(404, { rdapConformance: ["rdap_level_0"] }, "application/json"), "unregistered"],
+      [json(404, {}), "unregistered"],
+    ];
+    for (const [res, expected] of cases) {
+      const { fn } = mockFetch(() => res);
+      expect((await provider(fn).lookup("examplebrand.net", "net")).status).toBe(expected);
+    }
+  });
+
+  it("treats a response body that times out as a timeout, not as invalid JSON", async () => {
+    const stalled = () => {
+      const body = new ReadableStream({
+        start(controller) {
+          const err = new Error("body timed out");
+          err.name = "TimeoutError";
+          controller.error(err);
+        },
+      });
+      return new Response(body, { status: 200, headers: { "content-type": "application/rdap+json" } });
+    };
+    const { fn, calls } = mockFetch(stalled);
+    const r = await provider(fn).lookup("examplebrand.com", "com");
+    expect(r.status).toBe("unknown");
+    expect(r.error).toMatch(/timeout/);
+    expect(calls).toHaveLength(1);
+  });
+
   it("returns unknown (not unregistered) on timeouts, without retrying the timeout", async () => {
     const { fn, calls } = mockFetch(() => {
       const err = new Error("timed out");
@@ -85,6 +123,7 @@ describe("RDAP provider", () => {
     const { fn, calls } = mockFetch(() => json(404, {}));
     const r = await provider(fn).lookup("examplebrand.org", "org", { deadline: Date.now() + 500 });
     expect(r.status).toBe("unknown");
+    expect(r.deferred).toBe(true);
     expect(calls).toHaveLength(0);
   });
 
@@ -100,6 +139,42 @@ describe("RDAP provider", () => {
       throw new TypeError("fetch failed");
     });
     expect((await provider(network.fn).lookup("examplebrand.xyz", "xyz")).status).toBe("unknown");
+  });
+
+  it("applies Retry-After to the whole registry host", async () => {
+    const { fn, calls } = mockFetch(() => new Response("", { status: 429, headers: { "retry-after": "60" } }));
+    const p = provider(fn);
+    expect((await p.lookup("a.com", "com")).status).toBe("unknown");
+    const next = await p.lookup("b.net", "net"); // same host: rdap.verisign.com
+    expect(next.status).toBe("unknown");
+    expect(next.error).toMatch(/rate limit/);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("understands Retry-After as seconds or as an HTTP date", async () => {
+    const now = Date.parse("2026-09-25T00:00:00Z");
+    expect(parseRetryAfter("5", now)).toBe(5_000);
+    expect(parseRetryAfter("Fri, 25 Sep 2026 00:00:08 GMT", now)).toBe(8_000);
+    expect(parseRetryAfter("Thu, 24 Sep 2026 23:59:00 GMT", now)).toBeUndefined();
+    expect(parseRetryAfter("soon", now)).toBeUndefined();
+    expect(parseRetryAfter(null, now)).toBeUndefined();
+
+    const sleeps: number[] = [];
+    const date = new Date(Date.now() + 4_000).toUTCString();
+    const limited = mockFetch(() => new Response("", { status: 429, headers: { "retry-after": date } }));
+    const p = new RdapProvider({
+      fetchImpl: limited.fn,
+      bootstrap,
+      perHostIntervalMs: 0,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+    await p.lookup("examplebrand.xyz", "xyz");
+    expect(limited.calls).toHaveLength(2);
+    const waited = Math.max(...sleeps);
+    expect(waited).toBeGreaterThan(2_000);
+    expect(waited).toBeLessThanOrEqual(4_000);
   });
 
   it("does not wait for long Retry-After values", async () => {
@@ -129,6 +204,45 @@ describe("RDAP provider", () => {
     expect((await p.lookup("examplebrand.co", "co")).status).toBe("unsupported");
     expect((await p.lookup("examplebrand.io", "io")).status).toBe("unsupported");
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe("loadBootstrap", () => {
+  afterEach(() => {
+    resetBootstrapCache();
+    vi.useRealTimers();
+  });
+
+  const liveDoc = { services: [[["com"], ["https://rdap.verisign.com/com/v1/"]], [["asia"], ["https://rdap.example.asia/"]]] };
+
+  it("keeps the last live list when a refresh fails", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const ok = mockFetch(() => json(200, liveDoc, "application/json"));
+    expect((await loadBootstrap(ok.fn)).map.has("asia")).toBe(true);
+
+    vi.setSystemTime(Date.now() + 13 * 60 * 60 * 1000); // cache expired
+    const down = mockFetch(() => new Response("", { status: 503 }));
+    const after = await loadBootstrap(down.fn);
+    expect(down.calls).toEqual([IANA_BOOTSTRAP_URL]);
+    expect(after.live).toBe(true);
+    expect(after.map.has("asia")).toBe(true);
+  });
+
+  it("shares one request between parallel callers", async () => {
+    const { fn, calls } = mockFetch(() => json(200, liveDoc, "application/json"));
+    await Promise.all([loadBootstrap(fn), loadBootstrap(fn), loadBootstrap(fn)]);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("reports unknown, not unsupported, for TLDs missing from the fallback snapshot", async () => {
+    const { fn, calls } = mockFetch((url) =>
+      url === IANA_BOOTSTRAP_URL ? new Response("", { status: 503 }) : json(404, {}),
+    );
+    const p = new RdapProvider({ fetchImpl: fn, sleep: noSleep, perHostIntervalMs: 0 });
+    const r = await p.lookup("examplebrand.asia", "asia");
+    expect(r.status).toBe("unknown");
+    expect(calls).toEqual([IANA_BOOTSTRAP_URL]);
+    expect((await p.lookup("examplebrand.com", "com")).status).toBe("unregistered");
   });
 });
 

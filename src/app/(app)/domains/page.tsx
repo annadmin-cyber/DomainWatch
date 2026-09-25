@@ -9,6 +9,7 @@ import { DEFAULT_SUFFIXES } from "@/lib/domains/extensions";
 import { formatDateTime } from "@/lib/format";
 import type { RegistrationStatus } from "@/lib/monitor/transition";
 import { STATUS_META, STATUS_ORDER } from "@/lib/status";
+import { selectAll } from "@/lib/supabase/select-all";
 import { suffixSupport } from "@/lib/support";
 import { addDomain } from "../actions";
 
@@ -32,31 +33,44 @@ export default async function DomainsPage(props: PageProps<"/domains">) {
   const statusFilter = typeof sp.status === "string" && sp.status in STATUS_META ? (sp.status as RegistrationStatus) : "";
   const mineFilter = sp.mine === "1";
 
+  // Read in pages ordered by a unique column: a plain select stops at
+  // Supabase's 1000-row cap without any error.
   const [domainsRes, variantsRes, settingsRes, support] = await Promise.all([
-    supabase.from("domains").select("id, base_domain, notes, is_active, created_at").order("base_domain"),
-    supabase
-      .from("monitored_domains")
-      .select("id, domain_id, fqdn, suffix, status, is_mine, is_active, baseline_status, last_checked_at, status_changed_at")
-      .order("fqdn"),
+    selectAll<{ id: string; base_domain: string; notes: string | null; is_active: boolean; created_at: string }>(
+      (from, to) =>
+        supabase
+          .from("domains")
+          .select("id, base_domain, notes, is_active, created_at")
+          .order("base_domain")
+          .range(from, to),
+    ),
+    selectAll<Variant>((from, to) =>
+      supabase
+        .from("monitored_domains")
+        .select("id, domain_id, fqdn, suffix, status, is_mine, is_active, baseline_status, last_checked_at, status_changed_at")
+        .order("fqdn")
+        .range(from, to),
+    ),
     supabase.from("app_settings").select("default_suffixes").eq("singleton", true).maybeSingle(),
     suffixSupport(),
   ]);
 
-  if (domainsRes.error || variantsRes.error) {
+  const loadError = domainsRes.error ?? variantsRes.error ?? settingsRes.error;
+  if (loadError) {
     return (
       <Alert tone="error" title="Data tidak bisa dimuat">
-        {domainsRes.error?.message ?? variantsRes.error?.message}. Pastikan file supabase/migrations/0001_init.sql sudah
-        dijalankan di Supabase.
+        {loadError.message}. Pastikan semua file di supabase/migrations sudah dijalankan di Supabase, lalu muat ulang
+        halaman ini.
       </Alert>
     );
   }
 
-  const domains = domainsRes.data ?? [];
-  const variants = (variantsRes.data ?? []) as Variant[];
+  const domains = domainsRes.data;
+  const variants = variantsRes.data;
   const defaults = (settingsRes.data?.default_suffixes as string[] | undefined) ?? DEFAULT_SUFFIXES;
   const byDomain = new Map<string, Variant[]>();
   for (const v of variants) byDomain.set(v.domain_id, [...(byDomain.get(v.domain_id) ?? []), v]);
-  const domainName = new Map(domains.map((d) => [d.id as string, d.base_domain as string]));
+  const domainName = new Map(domains.map((d) => [d.id, d.base_domain]));
 
   const filtered = variants.filter(
     (v) =>
@@ -118,7 +132,7 @@ export default async function DomainsPage(props: PageProps<"/domains">) {
         <>
           <section className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {domains.map((d) => {
-              const vs = byDomain.get(d.id as string) ?? [];
+              const vs = byDomain.get(d.id) ?? [];
               const reg = vs.filter((v) => v.status === "registered" && !v.is_mine).length;
               return (
                 <Link key={d.id} href={`/domains/${d.id}`} className="card block p-4 hover:border-indigo-300">

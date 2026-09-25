@@ -62,7 +62,7 @@ export type RunOutcome = {
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-type CheckOutcome = { status: DomainUpdate["status"]; event: boolean };
+type CheckOutcome = { status: DomainUpdate["status"]; event: boolean; deferred?: boolean };
 
 /** Check one variant, persist results and create events/notifications idempotently. */
 export async function checkDomain(
@@ -89,6 +89,9 @@ export async function checkDomain(
       durationMs: 0,
     };
   }
+  // Out of time before any request was sent: record nothing, so the domain
+  // stays due and a continuation run checks it.
+  if (primary.deferred) return { status: state.status, event: false, deferred: true };
   await repo.saveCheck(state.id, runId, primary, false, now());
 
   let confirmation: LookupResult | undefined;
@@ -217,12 +220,15 @@ export async function runMonitor(deps: EngineDeps, opts: RunOptions): Promise<Ru
     events = 0;
   let fatal: string | null = null;
   let remaining = 0;
+  // Set when a lookup could not start before the hard deadline: stop claiming.
+  let outOfTime = false;
 
   try {
     try {
-      while (stopStarting - now().getTime() > cfg.reserveMs) {
+      while (!outOfTime && stopStarting - now().getTime() > cfg.reserveMs) {
         const batch = await repo.claimDue(cfg.batchSize, dueBefore, cfg.claimSeconds);
         if (batch.length === 0) break;
+        // Claims of variants not checked in this run are released right away.
         const unstarted = new Set(batch.map((d) => d.id));
         await pool(batch, cfg.concurrency, async (state) => {
           if (now().getTime() >= stopStarting) return;
@@ -232,6 +238,11 @@ export async function runMonitor(deps: EngineDeps, opts: RunOptions): Promise<Ru
               confirmDelayMs: cfg.confirmDelayMs,
               deadline: hardDeadline,
             });
+            if (r.deferred) {
+              outOfTime = true;
+              unstarted.add(state.id);
+              return;
+            }
             checked++;
             if (r.status === "registered" || r.status === "unregistered") conclusive++;
             else if (r.status === "unknown") errors++;

@@ -28,6 +28,10 @@ export default async function DomainDetailPage(props: PageProps<"/domains/[id]">
       .order("fqdn"),
     suffixSupport(),
   ]);
+  // A failed query must not render as "no variants": saving the form below
+  // would then remove every variant. error.tsx shows the failure instead.
+  const loadError = domainRes.error ?? variantsRes.error;
+  if (loadError) throw new Error(`Domain page query failed: ${loadError.message}`);
   const domain = domainRes.data;
   if (!domain) notFound();
   const variants = (variantsRes.data ?? []) as {

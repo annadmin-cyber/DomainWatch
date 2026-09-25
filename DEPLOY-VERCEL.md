@@ -57,7 +57,7 @@ Semua file aman dijalankan ulang. Cek: menu **Table Editor** sekarang berisi tab
 
 1. Supabase > **Authentication** > **Users** > **Add user** > **Create new user**.
 2. Isi email Anda dan kata sandi yang kuat. **Centang "Auto Confirm User"**. Klik **Create user**.
-3. Matikan pendaftaran publik supaya orang lain tidak bisa membuat akun: **Authentication** > **Sign In / Providers** (atau **Providers**) > matikan **Allow new users to sign up** > **Save**.
+3. Matikan pendaftaran publik supaya orang lain tidak bisa membuat akun: **Authentication** > **Sign In / Providers** (atau **Providers**) > matikan **Allow new users to sign up** > **Save**. Hanya pilihan itu yang dimatikan: provider **Email** di halaman yang sama harus tetap aktif, karena jika dimatikan login ke DomainWatch akan selalu gagal.
 4. Daftarkan akun itu sebagai pemilik:
    - Di GitHub buka `supabase/setup-owner.sql`, salin isinya.
    - Supabase > **SQL Editor** > **New query**, tempel.
@@ -84,6 +84,13 @@ Di halaman impor Vercel, buka bagian **Environment Variables**. Tambahkan satu p
 
 Salin nilai langsung dari Supabase ke Vercel. Jangan menempelkannya di chat.
 
+Vercel juga meminta **jenis** setiap variabel:
+
+- `NEXT_PUBLIC_SUPABASE_URL` dan `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` harus **Config**. Jika Anda memilih Secret, Vercel memperingatkan "Remove the public framework prefix...". Jangan hapus awalan `NEXT_PUBLIC_`; cukup pilih **Config**.
+- `SUPABASE_SECRET_KEY`, `CRON_SECRET`, dan `TELEGRAM_BOT_TOKEN` harus **Secret/Sensitive**.
+
+Setiap kali Anda menambah atau mengubah variabel setelah deploy, lakukan **Redeploy** (lihat Langkah 8), karena nilai `NEXT_PUBLIC_` dibaca saat aplikasi dibangun.
+
 ## Langkah 8 — Deploy
 
 1. Klik **Deploy**. Tunggu sampai muncul "Congratulations" (sekitar 1–3 menit).
@@ -107,6 +114,8 @@ Jika environment variable baru ditambahkan atau diubah setelah deploy: **Deploym
 
 Jika muncul "Akses ditolak": email di Langkah 5.4 belum cocok. Jalankan ulang `setup-owner.sql` dengan email yang benar.
 
+Jika login gagal dengan pesan tentang koneksi atau kunci Supabase, buka `https://domainwatch-xxxx.vercel.app/setup`. Halaman itu memeriksa koneksi ke Supabase dan menunjukkan bagian yang salah (tanpa menampilkan kunci rahasia).
+
 ## Langkah 11 — Uji pengecekan nyata dan baseline
 
 1. Klik nama domain Anda, lalu di salah satu varian (misalnya `.net`) klik **Cek sekarang**.
@@ -119,9 +128,9 @@ Jika muncul "Akses ditolak": email di Langkah 5.4 belum cocok. Jalankan ulang `s
 
 Jadwal: setiap hari pukul 01.00 UTC (sekitar **08.00–08.59 WIB**; paket Hobby bisa meleset hingga 59 menit).
 
-1. Vercel > proyek Anda > **Settings** > **Cron Jobs**: harus ada `/api/cron/monitor` dengan jadwal `0 1 * * *`. Tombol **Run** di sana menjalankannya sekarang juga (untuk uji).
+1. Vercel > proyek Anda > **Settings** > **Cron Jobs**: harus ada `/api/cron/monitor` dengan jadwal `0 1 * * *`. Tombol **Run** di sana menjalankannya sekarang juga. Ini hanya membuktikan bahwa alamatnya berfungsi, bukan bahwa jadwalnya berjalan: proses dari tombol **Run** juga tercatat sebagai **Terjadwal**.
 2. Vercel > **Logs**: cari `/api/cron/monitor`. Harus ada status **202**, lalu baris `DomainWatch monitor run`.
-3. Di aplikasi: **Dashboard** menampilkan kotak hijau **"Pemantauan otomatis berjalan"** hanya jika proses terjadwal benar-benar pernah berjalan dalam 26 jam terakhir. **Pengaturan > Riwayat pemantauan** menampilkan setiap proses dengan jenis **Terjadwal**.
+3. Untuk memastikan jadwal harian benar-benar berjalan, jangan tekan **Run** dan periksa keesokan harinya: **Pengaturan > Riwayat pemantauan** harus menampilkan proses baru berjenis **Terjadwal** dengan waktu **Mulai** antara pukul 08.00 dan 09.00 WIB. Setelah itu, **Dashboard** menampilkan kotak hijau **"Pemantauan otomatis berjalan"** selama proses terjadwal berjalan dalam 26 jam terakhir.
 
 ## Langkah 13 — Telegram (opsional)
 
@@ -142,5 +151,6 @@ Setiap perubahan kode yang masuk ke branch `main` di GitHub otomatis di-deploy u
 ## Catatan batasan (paket gratis)
 
 - Vercel Hobby: cron hanya sekali sehari, durasi fungsi maksimal 300 detik. Aplikasi membagi pekerjaan menjadi beberapa proses lanjutan otomatis bila domainnya banyak.
+- `vercel.json` sudah mengatur agar fungsi berjalan di region Singapura (`sin1`, dekat database Supabase) dan menyalakan *fluid compute* yang dibutuhkan untuk durasi 300 detik. Anda tidak perlu mengubahnya.
 - Supabase Free: proyek yang tidak aktif selama 7 hari bisa di-*pause*. Pengecekan harian biasanya menjaga proyek tetap aktif, tetapi jika proyek ter-pause, buka dashboard Supabase dan klik **Restore**.
 - "Belum terdaftar" tidak menjamin domain bisa dibeli (bisa premium, dicadangkan, atau dalam masa tunggu).

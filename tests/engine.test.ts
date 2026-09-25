@@ -222,6 +222,25 @@ describe("runs, locking and batching", () => {
     expect(first.checked + second.checked).toBe(10);
   });
 
+  it("leaves a lookup that ran out of time before any request for the continuation", async () => {
+    const late = repo.addDomain("late.net");
+    const ok = repo.addDomain("ok.net");
+    provider.set("ok.net", "registered");
+    provider.lookup = (async function (this: FixtureProvider, fqdn: string) {
+      if (fqdn === "late.net") {
+        return { status: "unknown", source: "fixture", error: "deadline", durationMs: 0, deferred: true } as const;
+      }
+      return FixtureProvider.prototype.lookup.call(this, fqdn);
+    }).bind(provider);
+
+    const out = await runMonitor(deps, { trigger: "cron", willContinue: true });
+    expect(out).toMatchObject({ status: "partial", checked: 1, errors: 0, remaining: 1 });
+    expect(repo.row(ok).status).toBe("registered");
+    // Nothing recorded for the deferred domain, and its claim is released.
+    expect(repo.row(late)).toMatchObject({ status: "not_checked", claimed_until: null, consecutive_failures: 0 });
+    expect(repo.checks.filter((c) => c.domainId === late)).toHaveLength(0);
+  });
+
   it("does not re-check domains checked recently unless forced", async () => {
     repo.addDomain("examplebrand.net");
     provider.set("examplebrand.net", "registered");

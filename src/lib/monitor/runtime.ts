@@ -28,11 +28,19 @@ export async function triggerContinuation(chainId: string, depth: number): Promi
   try {
     const res = await fetch(`${base}/api/cron/monitor?chain=${encodeURIComponent(chainId)}&depth=${depth}`, {
       headers: { authorization: `Bearer ${secret}` },
+      // Following a redirect (e.g. example.com -> www.example.com) would drop
+      // the Authorization header, so a redirect counts as a failure instead.
+      redirect: "manual",
       signal: AbortSignal.timeout(15_000),
       cache: "no-store",
     });
-    if (!res.ok) console.warn(`Continuation request returned HTTP ${res.status}`);
-    return res.ok;
+    if (res.ok) return true;
+    const location = res.headers.get("location");
+    console.warn(
+      `Continuation request returned HTTP ${res.status}` +
+        (location ? ` (redirect to ${location}; set APP_URL to the final production URL)` : ""),
+    );
+    return false;
   } catch (err) {
     console.warn("Continuation request failed:", err);
     return false;

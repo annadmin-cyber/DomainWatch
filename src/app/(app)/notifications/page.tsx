@@ -15,11 +15,12 @@ const DELIVERY_LABEL: Record<string, { label: string; className: string }> = {
 
 export default async function NotificationsPage() {
   const { supabase } = await requireOwnerPage();
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("notifications")
     .select("id, kind, title, body, created_at, read_at, is_demo, notification_deliveries(status, last_error, sent_at)")
     .order("created_at", { ascending: false })
     .limit(100);
+  if (error) throw new Error(`Notifications query failed: ${error.message}`);
   const items = (data ?? []) as {
     id: string;
     kind: string;

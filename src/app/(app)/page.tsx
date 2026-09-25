@@ -4,21 +4,57 @@ import { Pill, StatusBadge } from "@/components/status-badge";
 import { Alert, EmptyState, PageHeader, StatCard } from "@/components/ui";
 import { requireOwnerPage } from "@/lib/auth";
 import { formatDateTime, formatRelative } from "@/lib/format";
-import { monitoringHealth, type RunRow } from "@/lib/health";
+import { monitoringHealth, STALE_AFTER_MS, type RunRow } from "@/lib/health";
 import type { RegistrationStatus } from "@/lib/monitor/transition";
 import { RunsTable } from "@/components/runs-table";
 import { EVENT_LABEL } from "@/lib/status";
 
+/** Result of a head count query; a failed query is shown by error.tsx, never as zero. */
+function countOf(res: { count: number | null; error: { message: string } | null }): number {
+  if (res.error) throw new Error(`Dashboard query failed: ${res.error.message}`);
+  return res.count ?? 0;
+}
+
 export default async function DashboardPage() {
   const { supabase } = await requireOwnerPage();
   const now = new Date();
+  const staleIso = new Date(now.getTime() - STALE_AFTER_MS).toISOString();
+  // Counts are computed in the database (head requests return no rows), so they
+  // stay correct however many variants exist.
+  const variantCount = () => supabase.from("monitored_domains").select("*", { count: "exact", head: true });
+  const activeCount = () => variantCount().eq("is_active", true);
 
-  const [domainsRes, variantsRes, eventsRes, runsRes, lastSuccessRes] = await Promise.all([
-    supabase.from("domains").select("id", { count: "exact", head: true }),
+  const [
+    domainsRes,
+    totalRes,
+    activeRes,
+    pendingRes,
+    failedRes,
+    overdueRes,
+    inconclusiveRes,
+    attentionRes,
+    eventsRes,
+    runsRes,
+    lastSuccessRes,
+  ] = await Promise.all([
+    supabase.from("domains").select("*", { count: "exact", head: true }),
+    variantCount(),
+    activeCount(),
+    activeCount().eq("status", "not_checked"),
+    activeCount().eq("status", "unknown"),
+    activeCount().or(`last_checked_at.is.null,last_checked_at.lt."${staleIso}"`),
+    activeCount()
+      .neq("status", "unsupported")
+      .or(`last_success_at.is.null,last_success_at.lt."${staleIso}"`),
+    // Descending status puts failed ("unknown") before never checked ("not_checked").
     supabase
       .from("monitored_domains")
-      .select("id, fqdn, domain_id, status, is_active, last_checked_at, last_error")
-      .order("fqdn"),
+      .select("id, fqdn, domain_id, status, last_error")
+      .eq("is_active", true)
+      .in("status", ["unknown", "not_checked"])
+      .order("status", { ascending: false })
+      .order("fqdn")
+      .limit(12),
     supabase
       .from("status_events")
       .select("id, event_type, detected_at, message, monitored_domains(id, fqdn, domain_id)")
@@ -34,21 +70,24 @@ export default async function DashboardPage() {
       .limit(1),
   ]);
 
-  const variants = (variantsRes.data ?? []) as {
+  for (const res of [attentionRes, eventsRes, runsRes, lastSuccessRes]) {
+    if (res.error) throw new Error(`Dashboard query failed: ${res.error.message}`);
+  }
+  const domainCount = countOf(domainsRes);
+  const total = countOf(totalRes);
+  const active = countOf(activeRes);
+  const pending = countOf(pendingRes);
+  const failed = countOf(failedRes);
+  const attention = (attentionRes.data ?? []) as {
     id: string;
     fqdn: string;
     domain_id: string;
     status: RegistrationStatus;
-    is_active: boolean;
-    last_checked_at: string | null;
     last_error: string | null;
   }[];
-  const active = variants.filter((v) => v.is_active);
   const runs = (runsRes.data ?? []) as RunRow[];
   const lastSuccess = (lastSuccessRes.data?.[0] ?? null) as RunRow | null;
-  const health = monitoringHealth(runs, active, now);
-  const pending = active.filter((v) => v.status === "not_checked");
-  const failed = active.filter((v) => v.status === "unknown");
+  const health = monitoringHealth(runs, { overdue: countOf(overdueRes), inconclusive: countOf(inconclusiveRes) }, now);
   const events = (eventsRes.data ?? []) as unknown as {
     id: string;
     event_type: string;
@@ -72,11 +111,11 @@ export default async function DashboardPage() {
       </div>
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard label="Domain utama" value={domainsRes.count ?? 0} />
-        <StatCard label="Varian dipantau" value={active.length} hint={`${variants.length - active.length} dijeda`} />
+        <StatCard label="Domain utama" value={domainCount} />
+        <StatCard label="Varian dipantau" value={active} hint={`${total - active} dijeda`} />
         <StatCard
           label="Tertunda / gagal"
-          value={`${pending.length} / ${failed.length}`}
+          value={`${pending} / ${failed}`}
           hint="Belum dicek / hasil tidak pasti"
         />
         <StatCard
@@ -86,7 +125,7 @@ export default async function DashboardPage() {
         />
       </div>
 
-      {variants.length === 0 ? (
+      {total === 0 ? (
         <div className="mt-8">
           <EmptyState title="Belum ada domain yang dipantau" action={{ href: "/domains", label: "Tambah domain pertama" }}>
             Tambahkan domain milik Anda, lalu pilih ekstensi lain yang ingin dipantau.
@@ -128,11 +167,11 @@ export default async function DashboardPage() {
           <div className="border-b border-slate-100 px-4 py-3">
             <h2 className="font-semibold">Pengecekan tertunda atau gagal</h2>
           </div>
-          {pending.length + failed.length === 0 ? (
+          {attention.length === 0 ? (
             <p className="px-4 py-6 text-sm text-slate-500">Tidak ada. Semua varian aktif sudah memiliki hasil.</p>
           ) : (
             <ul className="divide-y divide-slate-100">
-              {[...failed, ...pending].slice(0, 12).map((v) => (
+              {attention.map((v) => (
                 <li key={v.id} className="flex items-start justify-between gap-3 px-4 py-3 text-sm">
                   <div>
                     <Link

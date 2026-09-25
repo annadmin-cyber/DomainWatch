@@ -95,6 +95,38 @@ describe("row level security", () => {
     ).rejects.toThrow(/permission denied/);
   });
 
+  it("lets the owner write only the columns the app edits", async () => {
+    // The columns written by src/app/(app)/actions.ts.
+    await as("authenticated", OWNER, async () => {
+      await db.exec(`insert into public.domains (base_domain, label, suffix, notes) values ('columns.com', 'columns', 'com', 'n')`);
+      await db.exec(`update public.domains set notes = 'note', is_active = true where base_domain = 'columns.com'`);
+      await db.exec(`insert into public.monitored_domains (domain_id, fqdn, suffix, is_mine, is_active)
+        select id, 'columns.net', 'net', false, false from public.domains where base_domain = 'columns.com'`);
+      await db.exec(`update public.monitored_domains set is_mine = true, is_active = true where fqdn = 'columns.net'`);
+    });
+
+    // Monitoring state and identity columns are server-only.
+    for (const sql of [
+      `update public.monitored_domains set status = 'registered'`,
+      `update public.monitored_domains set claimed_until = '9999-12-31'`,
+      `update public.monitored_domains set last_conclusive_status = 'unregistered', last_confirmed_unregistered_at = now()`,
+      `update public.monitored_domains set baseline_status = 'unregistered'`,
+      `update public.monitored_domains set fqdn = 'renamed.net'`,
+      `update public.domains set base_domain = 'renamed.com'`,
+      `insert into public.monitored_domains (domain_id, fqdn, suffix, status)
+        select id, 'columns.org', 'org', 'registered' from public.domains where base_domain = 'columns.com'`,
+    ]) {
+      await expect(as("authenticated", OWNER, () => db.exec(sql)), sql).rejects.toThrow(/permission denied/);
+    }
+
+    const r = await db.query<{ status: string; is_mine: boolean; is_active: boolean; claimed_until: string | null }>(
+      `select status, is_mine, is_active, claimed_until from public.monitored_domains where fqdn = 'columns.net'`,
+    );
+    expect(r.rows).toEqual([{ status: "not_checked", is_mine: true, is_active: true, claimed_until: null }]);
+    await as("authenticated", OWNER, () => db.exec(`delete from public.domains where base_domain = 'columns.com'`));
+    expect((await db.query(`select 1 from public.monitored_domains where fqdn = 'columns.net'`)).rows).toHaveLength(0);
+  });
+
   it("denies TRUNCATE (which bypasses RLS) to API roles", async () => {
     await expect(as("authenticated", STRANGER, () => db.exec(`truncate public.app_settings cascade`))).rejects.toThrow(
       /permission denied/,
@@ -174,6 +206,14 @@ describe("constraints and server functions", () => {
     expect((await hit()).rows[0].ok).toBe(true);
     expect((await hit()).rows[0].ok).toBe(true);
     expect((await hit()).rows[0].ok).toBe(false);
+  });
+
+  it("prunes rate-limit windows older than a day", async () => {
+    await db.exec(`insert into public.rate_limits (key, window_start, hits) values ('stale', now() - interval '2 days', 3)`);
+    await as("service_role", null, () => db.query(`select public.hit_rate_limit('fresh', 5, 60)`));
+    const keys = (await db.query<{ key: string }>(`select key from public.rate_limits`)).rows.map((r) => r.key);
+    expect(keys).not.toContain("stale");
+    expect(keys).toEqual(expect.arrayContaining(["fresh", "k"]));
   });
 
   it("lets the owner mark a notification read but not rewrite it", async () => {

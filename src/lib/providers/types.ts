@@ -16,6 +16,11 @@ export type LookupResult = {
   /** Why the result is unknown/unsupported (Indonesian, shown in UI) */
   error?: string;
   durationMs: number;
+  /**
+   * No request was sent because the run's time ran out. Such a result is not
+   * recorded; the domain is left for a later (continuation) run.
+   */
+  deferred?: boolean;
 };
 
 export type LookupOptions = {

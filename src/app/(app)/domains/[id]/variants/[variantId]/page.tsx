@@ -39,6 +39,8 @@ export default async function VariantDetailPage(props: PageProps<"/domains/[id]/
       .order("detected_at", { ascending: false })
       .limit(20),
   ]);
+  const loadError = variantRes.error ?? checksRes.error ?? eventsRes.error;
+  if (loadError) throw new Error(`Variant page query failed: ${loadError.message}`);
   const v = variantRes.data;
   if (!v) notFound();
   const status = v.status as RegistrationStatus;

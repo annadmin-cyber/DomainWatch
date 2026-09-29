@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { checkPublicKey, describeSecretKeyCheck, projectRefOf } from "@/lib/supabase/diagnostics";
+import { checkPublicKey, describeSecretKeyCheck, projectRefOf, urlLines } from "@/lib/supabase/diagnostics";
 
 const URL_ = "https://abcd1234.supabase.co";
 const KEY = "sb_publishable_secretlooking_value";
@@ -71,5 +71,18 @@ describe("Supabase self-check (/setup)", () => {
     expect(text({ data: null, error: { message: "TypeError: fetch failed", code: "" }, status: 0 })[0]).toMatch(
       /Tidak bisa menghubungi/,
     );
+  });
+});
+
+describe("urlLines", () => {
+  it("warns about an API path after the project URL, and stays quiet otherwise", () => {
+    expect(urlLines("https://abcd1234.supabase.co")).toEqual([]);
+    expect(urlLines("https://abcd1234.supabase.co/")).toEqual([]);
+    const [line] = urlLines("https://abcd1234.supabase.co/rest/v1/");
+    expect(line.tone).toBe("warning");
+    expect(line.text).toContain("/rest/v1/");
+    expect(line.hint).toContain("https://abcd1234.supabase.co");
+    expect(urlLines(undefined)).toEqual([]);
+    expect(urlLines("not a url")).toEqual([]);
   });
 });

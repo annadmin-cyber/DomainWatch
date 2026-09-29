@@ -155,6 +155,9 @@ export async function updateDomain(_prev: ActionState, formData: FormData): Prom
   const notes = String(formData.get("notes") ?? "").trim().slice(0, 500) || null;
   const isActive = formData.get("is_active") === "on";
   const suffixes = selectedSuffixes(formData);
+  // Variants the form showed as ticked. Anything else (added in another tab,
+  // or a form rendered without its variants) is never removed by this save.
+  const shown = new Set(formData.getAll("shown_suffixes").map(String));
 
   const { data: domain, error: readErr } = await ctx.supabase
     .from("domains")
@@ -185,7 +188,9 @@ export async function updateDomain(_prev: ActionState, formData: FormData): Prom
       .eq("domain_id", id);
     check(listErr, "Gagal membaca varian");
     const current = new Set((variants ?? []).map((v) => v.suffix as string));
-    const toRemove = (variants ?? []).filter((v) => !suffixes.includes(v.suffix as string)).map((v) => v.id as string);
+    const toRemove = (variants ?? [])
+      .filter((v) => shown.has(v.suffix as string) && !suffixes.includes(v.suffix as string))
+      .map((v) => v.id as string);
     if (toRemove.length > 0) {
       const { error: delErr } = await ctx.supabase.from("monitored_domains").delete().in("id", toRemove);
       check(delErr, "Gagal menghapus ekstensi");

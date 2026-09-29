@@ -66,12 +66,30 @@ describe("publicSupabaseConfig", () => {
     process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = "sb_publishable_x";
     process.env.NEXT_PUBLIC_SUPABASE_URL = "abcd1234.supabase.co";
     expect(publicSupabaseConfig()).toBeNull();
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https:abcd1234.supabase.co"; // parses, but supabase-js rejects it
+    expect(publicSupabaseConfig()).toBeNull();
     expect(configStatus().find((c) => c.name === "NEXT_PUBLIC_SUPABASE_URL")).toMatchObject({ ok: false, invalid: true });
     expect(missingRequiredConfig()).toContain("NEXT_PUBLIC_SUPABASE_URL");
 
     process.env.NEXT_PUBLIC_SUPABASE_URL = "https://abcd1234.supabase.co";
     expect(publicSupabaseConfig()).toEqual({ url: "https://abcd1234.supabase.co", key: "sb_publishable_x" });
     expect(missingRequiredConfig()).not.toContain("NEXT_PUBLIC_SUPABASE_URL");
+  });
+
+  it("reduces a copied API endpoint to the bare project URL", () => {
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = "sb_publishable_x";
+    for (const value of [
+      "https://abcd1234.supabase.co/",
+      "https://abcd1234.supabase.co/rest/v1/",
+      "https://abcd1234.supabase.co/rest/v1",
+      "https://abcd1234.supabase.co/auth/v1/",
+    ]) {
+      process.env.NEXT_PUBLIC_SUPABASE_URL = value;
+      expect(publicSupabaseConfig()?.url).toBe("https://abcd1234.supabase.co");
+    }
+    // Other paths (e.g. a self-hosted gateway prefix) are kept.
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://db.example.com/supabase/";
+    expect(publicSupabaseConfig()?.url).toBe("https://db.example.com/supabase");
   });
 });
 
